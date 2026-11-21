@@ -1,6 +1,6 @@
 [package]
 name = "ebb"
-version = "26.3.0"
+version = "26.3.1"
 edition = "2024"
 description = "Minimal macOS Menu Bar monitor for Claude Code, OpenAI Codex, and Antigravity CLI quota"
 

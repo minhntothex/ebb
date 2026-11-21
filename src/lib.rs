@@ -1,5 +1,5 @@
 /// Human-facing CalVer release string (`XX.Y[.Z]`, `Y` starts at `0`).
-pub const APP_VERSION: &str = "26.3";
+pub const APP_VERSION: &str = "26.3.1";
 
 /// Display name used in macOS UI and Application Support directory.
 pub const APP_NAME: &str = "Ebb";

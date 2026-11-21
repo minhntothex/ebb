@@ -10,7 +10,7 @@
 
 ## Versioning
 
-Current version: **`26.3`**
+Current version: **`26.3.1`**
 
 `ebb` uses the **`XX.Y(.Z)`** calendar versioning scheme (`Z` is optional):
 
@@ -29,7 +29,7 @@ Current version: **`26.3`**
 
 ### Option A: Download prebuilt Universal binary (Apple Silicon & Intel)
 
-1. Download `ebb-26.3-macos-universal.dmg` (or `.zip`) from [GitHub Releases](https://github.com/minhntothex/ebb/releases).
+1. Download `ebb-26.3.1-macos-universal.dmg` (or `.zip`) from [GitHub Releases](https://github.com/minhntothex/ebb/releases).
 2. Drag **`Ebb.app`** into `/Applications`.
 3. Releases are ad-hoc signed. If macOS Gatekeeper blocks the first launch, clear the quarantine attribute once:
 

@@ -8,7 +8,7 @@ use objc2::{AnyThread, MainThreadMarker};
 use objc2_app_kit::{
     NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSColor, NSFont,
     NSFontAttributeName, NSFontWeightSemibold, NSForegroundColorAttributeName, NSMenu, NSStatusBar,
-    NSStatusItem, NSVariableStatusItemLength,
+    NSStatusItem, NSTextAlignment, NSVariableStatusItemLength,
 };
 use objc2_foundation::{
     NSArray, NSAttributedString, NSDictionary, NSMutableAttributedString, NSString,
@@ -23,6 +23,8 @@ use crate::ui::view_model::{
 const MENU_BAR_FONT_SIZE: f64 = 11.5;
 const SEGMENT_SEPARATOR: &str = "  ";
 const STALE_ALPHA: f64 = 0.65;
+/// Extra horizontal padding beyond macOS's fixed-length `NSStatusItem` natural width (`0.0` = clean ~4pt per side).
+pub const MENU_BAR_EXTRA_PAD_X: f64 = 0.0;
 
 /// Dynamic `NSColor` adapting automatically between Dark Mode and Light Mode for any color pair.
 pub fn dynamic_color_for_pair(pair: ProviderColorPair, stale: bool) -> Retained<NSColor> {
@@ -80,9 +82,10 @@ pub struct StatusBarDebugInfo {
     pub title_len: usize,
     pub width_pt: f64,
     pub height_pt: f64,
+    pub item_length_pt: f64,
 }
 
-/// Owns the single variable-length macOS `NSStatusItem` and updates it strictly on change.
+/// Owns the single macOS `NSStatusItem` sized via explicit fixed length for balanced horizontal padding.
 pub struct StatusBarView {
     item: Retained<NSStatusItem>,
     font: Retained<NSFont>,
@@ -90,9 +93,12 @@ pub struct StatusBarView {
 }
 
 impl StatusBarView {
-    pub fn new(_mtm: MainThreadMarker) -> Self {
+    pub fn new(mtm: MainThreadMarker) -> Self {
         let status_bar = NSStatusBar::systemStatusBar();
         let item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
+        if let Some(button) = item.button(mtm) {
+            button.setAlignment(NSTextAlignment::Center);
+        }
         let font = unsafe {
             NSFont::monospacedDigitSystemFontOfSize_weight(MENU_BAR_FONT_SIZE, NSFontWeightSemibold)
         };
@@ -122,11 +128,14 @@ impl StatusBarView {
         }
 
         if let Some(button) = self.item.button(mtm) {
+            self.item.setLength(NSVariableStatusItemLength);
             let attributed = self.build_attributed_title(snapshot);
             button.setAttributedTitle(&attributed);
             let tooltip = NSString::from_str(&snapshot.menu_bar_tooltip);
             button.setToolTip(Some(&tooltip));
             button.sizeToFit();
+            let natural_w = button.frame().size.width;
+            self.item.setLength(natural_w + 2.0 * MENU_BAR_EXTRA_PAD_X);
         }
 
         self.last_render = Some(next_key);
@@ -141,6 +150,7 @@ impl StatusBarView {
             title_len: title.length(),
             width_pt: frame.size.width,
             height_pt: frame.size.height,
+            item_length_pt: self.item.length(),
         })
     }
 

@@ -1,5 +1,5 @@
 cask "ebb" do
-  version "26.3"
+  version "26.3.1"
   # Replace :no_check with the DMG sha256 from SHA256SUMS.txt (populated automatically in dist/ebb.rb on release).
   sha256 :no_check
 

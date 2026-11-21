@@ -37,7 +37,7 @@ use crate::refresh::{
 };
 use crate::ui::menu::{DropdownMenu, MenuAction};
 use crate::ui::notifications::NotificationSender;
-use crate::ui::status_bar::StatusBarView;
+use crate::ui::status_bar::{MENU_BAR_EXTRA_PAD_X, StatusBarView};
 use crate::ui::view_model::UiSnapshot;
 use crate::updates::{UpdateCheckResult, check_latest_release};
 use crate::watcher::AppDirWatcher;
@@ -750,6 +750,12 @@ pub fn run_ui_smoke_test() -> Result<()> {
 
     assert_eq!(sb_info.title_len, 12, "expected 5 + 2(spaces) + 5 chars");
     assert!(sb_info.width_pt > 40.0 && sb_info.width_pt < 120.0);
+    assert!(
+        sb_info.item_length_pt >= 60.0 + 2.0 * MENU_BAR_EXTRA_PAD_X
+            && sb_info.item_length_pt < 120.0,
+        "expected fixed-length item width, got {}pt",
+        sb_info.item_length_pt
+    );
     assert!(menu_info.top_level_items >= 10);
     assert_eq!(menu_info.header_right_text, "Updated just now");
     assert_eq!(menu_info.claude_row_text, "● Claude\t65% / 72%");
@@ -800,9 +806,10 @@ pub fn run_ui_smoke_test() -> Result<()> {
     assert!(dropdown.apply(&partial_snap));
 
     println!(
-        "UI smoke test OK: status_bar={}ptx{}pt (len={}), menu_items={}, header_right={:?}, claude={:?}, claude_reset={:?}, codex={:?}",
+        "UI smoke test OK: status_bar={}ptx{}pt (item_len={}pt, len={}), menu_items={}, header_right={:?}, claude={:?}, claude_reset={:?}, codex={:?}",
         sb_info.width_pt,
         sb_info.height_pt,
+        sb_info.item_length_pt,
         sb_info.title_len,
         menu_info.top_level_items,
         menu_info.header_right_text,
