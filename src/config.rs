@@ -12,8 +12,18 @@ pub const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 60;
 pub const DEFAULT_CLAUDE_STALE_AFTER_SECS: u64 = 900; // 15m (passive status-line source)
 pub const DEFAULT_CODEX_STALE_AFTER_SECS: u64 = 180; // 3m (active poll source)
 pub const DEFAULT_SNAPSHOT_TTL_SECS: u64 = 21_600; // 6h max cache visibility
+pub const DEFAULT_SHOW_RESET_TIME: bool = true;
+pub const DEFAULT_ALERTS_ENABLED: bool = true;
+pub const DEFAULT_ALERT_WARNING_THRESHOLD: u8 = 20;
+pub const DEFAULT_ALERT_CRITICAL_THRESHOLD: u8 = 5;
 
-/// Canonical `config.json` schema for MVP v1.
+/// Preset warning thresholds (remaining %) exposed in Settings submenu.
+pub const WARNING_THRESHOLD_PRESETS: [u8; 5] = [30, 25, 20, 15, 10];
+
+/// Preset critical thresholds (remaining %) exposed in Settings submenu.
+pub const CRITICAL_THRESHOLD_PRESETS: [u8; 3] = [10, 5, 3];
+
+/// Canonical `config.json` schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -26,6 +36,10 @@ pub struct AppConfig {
     pub claude_stale_after_seconds: u64,
     pub codex_stale_after_seconds: u64,
     pub snapshot_ttl_seconds: u64,
+    pub show_reset_time: bool,
+    pub alerts_enabled: bool,
+    pub alert_warning_threshold: u8,
+    pub alert_critical_threshold: u8,
 }
 
 impl Default for AppConfig {
@@ -39,11 +53,45 @@ impl Default for AppConfig {
             claude_stale_after_seconds: DEFAULT_CLAUDE_STALE_AFTER_SECS,
             codex_stale_after_seconds: DEFAULT_CODEX_STALE_AFTER_SECS,
             snapshot_ttl_seconds: DEFAULT_SNAPSHOT_TTL_SECS,
+            show_reset_time: DEFAULT_SHOW_RESET_TIME,
+            alerts_enabled: DEFAULT_ALERTS_ENABLED,
+            alert_warning_threshold: DEFAULT_ALERT_WARNING_THRESHOLD,
+            alert_critical_threshold: DEFAULT_ALERT_CRITICAL_THRESHOLD,
         }
     }
 }
 
 impl AppConfig {
+    /// Update warning threshold while preserving `1 <= critical < warning <= 100`.
+    pub fn set_warning_threshold(&mut self, warning: u8) -> Result<()> {
+        if !(2..=100).contains(&warning) {
+            return Err(AppError::InvalidConfig(format!(
+                "alert_warning_threshold must be in 2..=100, got {warning}"
+            )));
+        }
+        self.alert_warning_threshold = warning;
+        if self.alert_critical_threshold >= warning {
+            self.alert_critical_threshold = CRITICAL_THRESHOLD_PRESETS
+                .iter()
+                .copied()
+                .find(|&c| c < warning)
+                .unwrap_or_else(|| warning.saturating_sub(1).max(1));
+        }
+        self.validate()
+    }
+
+    /// Update critical threshold while preserving `1 <= critical < warning`.
+    pub fn set_critical_threshold(&mut self, critical: u8) -> Result<()> {
+        if critical == 0 || critical >= self.alert_warning_threshold {
+            return Err(AppError::InvalidConfig(format!(
+                "alert_critical_threshold must be in 1..{}, got {critical}",
+                self.alert_warning_threshold
+            )));
+        }
+        self.alert_critical_threshold = critical;
+        self.validate()
+    }
+
     /// Validate configuration invariants.
     pub fn validate(&self) -> Result<()> {
         if !(MIN_REFRESH_INTERVAL_SECS..=MAX_REFRESH_INTERVAL_SECS)
@@ -68,6 +116,24 @@ impl AppConfig {
             return Err(AppError::InvalidConfig(
                 "snapshot_ttl_seconds must be > 0".into(),
             ));
+        }
+        if self.alert_critical_threshold == 0 || self.alert_critical_threshold > 99 {
+            return Err(AppError::InvalidConfig(format!(
+                "alert_critical_threshold must be in 1..=99, got {}",
+                self.alert_critical_threshold
+            )));
+        }
+        if self.alert_warning_threshold < 2 || self.alert_warning_threshold > 100 {
+            return Err(AppError::InvalidConfig(format!(
+                "alert_warning_threshold must be in 2..=100, got {}",
+                self.alert_warning_threshold
+            )));
+        }
+        if self.alert_critical_threshold >= self.alert_warning_threshold {
+            return Err(AppError::InvalidConfig(format!(
+                "alert_critical_threshold ({}) must be less than alert_warning_threshold ({})",
+                self.alert_critical_threshold, self.alert_warning_threshold
+            )));
         }
         if let Some(ref p) = self.codex_path
             && p.trim().is_empty()

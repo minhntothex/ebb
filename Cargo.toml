@@ -1,6 +1,6 @@
 [package]
 name = "ebb"
-version = "26.0.0"
+version = "26.1.0"
 edition = "2024"
 description = "Minimal macOS Menu Bar monitor for Claude Code and OpenAI Codex remaining quota"
 
@@ -16,7 +16,9 @@ objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = [
     "NSArray",
     "NSAttributedString",
+    "NSBundle",
     "NSDictionary",
+    "NSError",
     "NSGeometry",
     "NSNotification",
     "NSObject",
@@ -24,6 +26,13 @@ objc2-foundation = { version = "0.3", features = [
     "NSString",
     "NSThread",
     "NSValue",
+] }
+objc2-user-notifications = { version = "0.3", features = [
+    "UNNotificationContent",
+    "UNNotificationRequest",
+    "UNNotificationSound",
+    "UNUserNotificationCenter",
+    "block2",
 ] }
 objc2-app-kit = { version = "0.3", features = [
     "NSAppearance",
@@ -44,6 +53,7 @@ objc2-app-kit = { version = "0.3", features = [
     "NSStatusItem",
     "NSText",
     "NSTextAttachment",
+    "NSTextField",
     "NSView",
     "NSWorkspace",
     "block2",

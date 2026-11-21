@@ -10,24 +10,37 @@
 
 ## Versioning
 
-Current version: **`26.0`**
+Current version: **`26.1`**
 
 `ebb` uses the **`XX.Y(.Z)`** calendar versioning scheme (`Z` is optional):
 
 - **`XX`** — last two digits of the current year (e.g. `26` for 2026)
-- **`Y`** — sequential release number within that year, starting at **`0`** (e.g. `26.0`, `26.5`, `26.12`)
-- **`Z`** *(optional)* — hotfix or sub-release of `Y` (e.g. `26.0.2`, `26.0.12`, `26.5.3`, `26.12.3`)
+- **`Y`** — sequential release number within that year, starting at **`0`** (e.g. `26.0`, `26.1`, `26.12`)
+- **`Z`** *(optional)* — hotfix or sub-release of `Y` (e.g. `26.0.2`, `26.1.1`, `26.5.3`)
 
 ---
 
 ## Installation
 
 ### Requirements
-- macOS 13 or later
-- Rust toolchain (`cargo`, edition 2024)
+- macOS 13 (Ventura) or later
 - **Claude Code** CLI and/or **OpenAI Codex** CLI signed in locally
+- *(Only when building from source)* Rust toolchain (`cargo`, edition 2024)
 
-### 1. Build and package `Ebb.app`
+### Option A: Download prebuilt Universal binary (Apple Silicon & Intel)
+
+1. Download `ebb-26.1-macos-universal.dmg` (or `.zip`) from [GitHub Releases](https://github.com/minhntothex/ebb/releases).
+2. Drag **`Ebb.app`** into `/Applications`.
+3. Releases are ad-hoc signed. If macOS Gatekeeper blocks the first launch, clear the quarantine attribute once:
+
+   ```bash
+   xattr -dr com.apple.quarantine /Applications/Ebb.app
+   open /Applications/Ebb.app
+   ```
+
+*(A ready-to-use Homebrew Cask template is also included at [`packaging/homebrew/ebb.rb`](packaging/homebrew/ebb.rb).)*
+
+### Option B: Build from source
 
 ```bash
 git clone https://github.com/minhntothex/ebb.git
@@ -42,7 +55,7 @@ cp -R dist/Ebb.app /Applications/
 open /Applications/Ebb.app
 ```
 
-### 2. Enable Claude Code quota feed (opt-in)
+### Enable Claude Code quota feed (opt-in)
 
 Claude Code emits `rate_limits` through its `statusLine` command during active sessions. `ebb` never modifies `~/.claude/settings.json` silently:
 
@@ -54,7 +67,7 @@ Claude Code emits `rate_limits` through its `statusLine` command during active s
 /Applications/Ebb.app/Contents/MacOS/ebb setup-claude-statusline --apply
 ```
 
-### 3. Optional configuration (`config.json`)
+### Optional configuration (`config.json`)
 
 Stored at `~/Library/Application Support/Ebb/config.json` (accessible via `Settings → Open Config Folder`):
 
@@ -63,6 +76,10 @@ Stored at `~/Library/Application Support/Ebb/config.json` (accessible via `Setti
   "refresh_interval_seconds": 60,
   "show_claude": true,
   "show_codex": true,
+  "show_reset_time": true,
+  "alerts_enabled": true,
+  "alert_warning_threshold": 20,
+  "alert_critical_threshold": 5,
   "launch_at_login": false,
   "codex_path": "/optional/path/to/codex"
 }
@@ -72,13 +89,24 @@ Stored at `~/Library/Application Support/Ebb/config.json` (accessible via `Setti
 
 ## Features
 
-- **Compact two-color Menu Bar display:** Shows only remaining `5h/weekly` numbers (`Claude` in orange, `Codex` in green) using system tabular numerals and dynamic Dark/Light Mode colors.
-- **Native `NSMenu` dropdown:** Displays `● Claude  65% / 72%` and `● Codex  43% / 31%` with per-provider freshness/error tooltips, `Refresh Now`, `Settings`, and `Quit`.
-- **In-menu Settings:** Switch refresh interval (`30s` / `1m` / `2m` / `5m`), toggle individual providers, enable `Launch at Login` (macOS LaunchAgent), or open the config directory.
+- **Compact two-color Menu Bar display:** Shows only remaining `5h/weekly` numbers (`Claude` in amber, `Codex` in green) using system tabular numerals and dynamic Dark/Light Mode colors, with no Dock or Menu Bar icon clutter.
+- **Aligned native `NSMenu` dropdown:** Header shows `Ebb` + flush-right last-updated status; each provider row displays `● Claude` / `● Codex` with flush-right `5h% / weekly%` values and an aligned `Reset in` countdown sub-row (`2h 15m / 4d 6h`) plus detailed hover tooltips.
+- **Low-quota macOS notifications:** Native `UNUserNotificationCenter` alerts when 5h or weekly remaining quota drops to Warning (default `≤ 20%`) or Critical (default `≤ 5%`), with per-reset-window anti-spam deduplication, severity escalation, and configurable thresholds right inside `Settings → Low Quota Alerts`.
+- **In-menu Settings:** Switch refresh interval (`30s` / `1m` / `2m` / `5m`), toggle individual providers, toggle `Show Reset Times`, configure `Low Quota Alerts`, enable `Launch at Login` (macOS LaunchAgent), or open the config directory.
 - **Safe Claude Code integration:** `ebb claude-statusline` writes an atomic `0600` cache and transparently chains any existing `statusLine` command (preserving `stdin`, `stdout`, `stderr`, and exit code) without sending model prompts.
 - **Zero-token OpenAI Codex polling:** Talks directly to short-lived `codex app-server --stdio` (`account/rateLimits/read`), auto-discovers `codex` across `$PATH`/Homebrew/NVM/daemon paths, maps windows strictly by actual duration (`300m` / `10080m`), enforces a 5-second timeout, and reaps child processes cleanly.
 - **Honest quota states:** Displays `–` when a window is missing, unauthenticated, or past TTL; preserves last-known-good values with a stale indicator on transient errors; never derives quota from token totals or fakes resets to `100`.
-- **Low footprint:** ~`591 KB` stripped release binary, ~`17 MB` idle RSS, `0%` idle CPU via a single `Condvar` worker thread that pauses on sleep and refreshes on wake.
+- **Low footprint & Universal packaging:** ~`615 KB` stripped binary, ~`17 MB` idle RSS, `0%` idle CPU via a single `Condvar` worker thread that pauses on sleep and refreshes on wake; automated Universal (`arm64` + `x86_64`) `.dmg` / `.zip` GitHub Releases and native `AppIcon.icns`.
+
+---
+
+## Backlog
+
+Planned items deferred beyond `26.1`:
+
+- **BL-001:** OpenCode quota adapter (provider/model-aware quota normalized to the same Menu Bar & dropdown format).
+- **BL-003:** Custom provider colors and display ordering.
+- **BL-005:** Lightweight usage history / trend visualization.
 
 ---
 

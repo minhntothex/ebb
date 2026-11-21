@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "[0-9][0-9].[0-9]*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to package and publish (e.g. 26.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release-macos-universal:
+    name: Build & Publish Universal macOS Release
+    runs-on: macos-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: meta
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          PLIST_VER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' packaging/Info.plist)"
+          if [[ "${TAG}" != "${PLIST_VER}" ]]; then
+            echo "error: tag (${TAG}) does not match Info.plist CFBundleShortVersionString (${PLIST_VER})" >&2
+            exit 1
+          fi
+          if ! grep -Fq "pub const APP_VERSION: &str = \"${TAG}\";" src/lib.rs; then
+            echo "error: tag (${TAG}) does not match APP_VERSION in src/lib.rs" >&2
+            exit 1
+          fi
+
+      - name: Install Rust toolchain (arm64 + x86_64)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify formatting, lints, and tests
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
+      - name: Build Apple Silicon (arm64) release binary
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Build Intel (x86_64) release binary
+        run: cargo build --release --target x86_64-apple-darwin
+
+      - name: Create Universal 2 binary
+        run: |
+          mkdir -p target/release
+          lipo -create \
+            target/aarch64-apple-darwin/release/ebb \
+            target/x86_64-apple-darwin/release/ebb \
+            -output target/release/ebb-universal
+          chmod 0755 target/release/ebb-universal
+          lipo -info target/release/ebb-universal
+
+      - name: Package Ebb.app, ZIP, DMG, and SHA256SUMS
+        run: |
+          ./scripts/package-app.sh \
+            --bin target/release/ebb-universal \
+            --arch universal \
+            --zip \
+            --dmg
+          (cd dist && shasum -a 256 -c SHA256SUMS.txt)
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          ZIP_FILE="dist/ebb-${TAG}-macos-universal.zip"
+          DMG_FILE="dist/ebb-${TAG}-macos-universal.dmg"
+          SUMS_FILE="dist/SHA256SUMS.txt"
+
+          NOTES=$(cat <<EOF
+          ## ebb ${TAG} (macOS Universal — Apple Silicon & Intel)
+
+          ### Install
+          1. Download \`ebb-${TAG}-macos-universal.dmg\` (or \`.zip\`) and drag **Ebb.app** into \`/Applications\`.
+          2. Because builds are ad-hoc signed, clear quarantine on first install if macOS blocks opening:
+             \`\`\`bash
+             xattr -dr com.apple.quarantine /Applications/Ebb.app
+             open /Applications/Ebb.app
+             \`\`\`
+          3. *(Optional)* Enable Claude Code status-line integration (backs up and chains any existing config):
+             \`\`\`bash
+             /Applications/Ebb.app/Contents/MacOS/ebb setup-claude-statusline --apply
+             \`\`\`
+          EOF
+          )
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" "${DMG_FILE}" "${ZIP_FILE}" "${SUMS_FILE}" --clobber
+          else
+            gh release create "${TAG}" "${DMG_FILE}" "${ZIP_FILE}" "${SUMS_FILE}" \
+              --title "ebb ${TAG}" \
+              --notes "${NOTES}"
+          fi

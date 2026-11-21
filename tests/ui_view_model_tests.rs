@@ -140,6 +140,11 @@ fn helper_formatters_for_relative_age_and_intervals() {
 #[cfg(target_os = "macos")]
 #[test]
 fn real_appkit_menu_bar_and_dropdown_smoke_test_passes() {
+    if std::env::var_os("CI").is_some() {
+        eprintln!("skipping WindowServer AppKit smoke test in headless CI environment");
+        return;
+    }
+
     let bin = env!("CARGO_BIN_EXE_ebb");
     let out = Command::new(bin)
         .arg("--ui-smoke-test")
@@ -154,6 +159,11 @@ fn real_appkit_menu_bar_and_dropdown_smoke_test_passes() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("UI smoke test OK"), "stdout={stdout}");
+    assert!(stdout.contains("Updated just now"), "stdout={stdout}");
     assert!(stdout.contains("● Claude\\t65% / 72%"), "stdout={stdout}");
+    assert!(
+        stdout.contains("Reset in\\t2h 15m / 4d 6h"),
+        "stdout={stdout}"
+    );
     assert!(stdout.contains("● Codex\\t43% / 31%"), "stdout={stdout}");
 }

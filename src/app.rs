@@ -15,15 +15,17 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol};
 
+use crate::alerts::{AlertLevel, AlertTracker, QuotaAlert};
 use crate::config::{AppConfig, AppPaths};
 use crate::error::{AppError, Result};
 use crate::launch_agent::LaunchAgentManager;
-use crate::model::{Provider, ProviderState, QuotaSnapshot, QuotaWindow};
+use crate::model::{Provider, ProviderState, QuotaSnapshot, QuotaWindow, WindowKind};
 use crate::providers::claude::ClaudeAdapter;
 use crate::refresh::{
     AppState, LiveQuotaFetcher, RefreshConfig, RefreshEvent, RefreshReason, RefreshScheduler,
 };
 use crate::ui::menu::{DropdownMenu, MenuAction};
+use crate::ui::notifications::NotificationSender;
 use crate::ui::status_bar::StatusBarView;
 use crate::ui::view_model::UiSnapshot;
 
@@ -92,6 +94,8 @@ impl WorkspaceObserver {
 struct MainThreadUi {
     paths: AppPaths,
     state: AppState,
+    alert_tracker: AlertTracker,
+    notifier: NotificationSender,
     scheduler: Arc<RefreshScheduler>,
     ui_alive: Arc<AtomicBool>,
     workspace_observer: Retained<WorkspaceObserver>,
@@ -123,6 +127,32 @@ impl MainThreadUi {
         self.scheduler.update_config(refresh_cfg);
     }
 
+    fn evaluate_and_notify(
+        &mut self,
+        fresh_claude: Option<&QuotaSnapshot>,
+        fresh_codex: Option<&QuotaSnapshot>,
+        now_secs: u64,
+    ) {
+        let mut alerts = Vec::new();
+        if let Some(snap) = fresh_claude
+            && !snap.is_stale(now_secs, self.state.config.claude_stale_after_seconds)
+        {
+            alerts.extend(
+                self.alert_tracker
+                    .evaluate(snap, &self.state.config, now_secs),
+            );
+        }
+        if let Some(snap) = fresh_codex {
+            alerts.extend(
+                self.alert_tracker
+                    .evaluate(snap, &self.state.config, now_secs),
+            );
+        }
+        for alert in alerts {
+            self.notifier.send(&alert, now_secs);
+        }
+    }
+
     fn shutdown(&self) {
         self.ui_alive.store(false, Ordering::Release);
         self.workspace_observer.unregister();
@@ -151,12 +181,27 @@ pub fn run_menu_bar_app() -> Result<()> {
         config.launch_at_login = agent.is_enabled();
     }
 
+    let now = unix_now_secs();
     let persisted_cache = paths.load_cache_or_empty().unwrap_or_default();
     let claude_snapshot = ClaudeAdapter::new(paths.claude_cache_path.clone())
         .read_snapshot()
         .ok()
         .flatten();
-    let state = AppState::from_persisted(config, persisted_cache, claude_snapshot, unix_now_secs());
+    let state = AppState::from_persisted(config, persisted_cache, claude_snapshot, now);
+
+    // Seed alert baseline from cached snapshots so launching Ebb never replays old alerts.
+    let mut alert_tracker = AlertTracker::new();
+    alert_tracker.seed_baseline(
+        state.claude.snapshot.as_ref(),
+        state.codex.snapshot.as_ref(),
+        &state.config,
+        now,
+    );
+    let mut notifier = NotificationSender::new();
+    if state.config.alerts_enabled {
+        notifier.ensure_authorized();
+    }
+
     let refresh_cfg =
         RefreshConfig::from_app_config(&state.config, paths.claude_cache_path.clone());
 
@@ -193,10 +238,27 @@ pub fn run_menu_bar_app() -> Result<()> {
                             ui.render(mtm);
                         }
                         RefreshEvent::Completed(outcome) => {
+                            let completed_at = outcome.completed_at;
+                            let fresh_claude = outcome
+                                .claude
+                                .as_ref()
+                                .and_then(|res| res.as_ref().ok())
+                                .and_then(|opt| opt.clone());
+                            let fresh_codex = outcome
+                                .codex
+                                .as_ref()
+                                .and_then(|res| res.as_ref().ok())
+                                .cloned();
+
                             let cache_changed = ui.state.apply_refresh_outcome(outcome);
                             if cache_changed {
                                 ui.persist_cache();
                             }
+                            ui.evaluate_and_notify(
+                                fresh_claude.as_ref(),
+                                fresh_codex.as_ref(),
+                                completed_at,
+                            );
                             ui.render(mtm);
                         }
                     }
@@ -217,6 +279,8 @@ pub fn run_menu_bar_app() -> Result<()> {
     let mut ui = MainThreadUi {
         paths,
         state,
+        alert_tracker,
+        notifier,
         scheduler: Arc::clone(&scheduler),
         ui_alive,
         workspace_observer,
@@ -273,6 +337,45 @@ fn handle_menu_action(ui_cell: &Rc<RefCell<Option<MainThreadUi>>>, action: MenuA
                 ui.render(mtm);
             }
         }
+        MenuAction::ToggleShowResetTime => {
+            if let Some(ui) = ui_cell.borrow_mut().as_mut() {
+                ui.state.config.show_reset_time = !ui.state.config.show_reset_time;
+                ui.persist_config();
+                ui.render(mtm);
+            }
+        }
+        MenuAction::ToggleAlerts => {
+            if let Some(ui) = ui_cell.borrow_mut().as_mut() {
+                ui.state.config.alerts_enabled = !ui.state.config.alerts_enabled;
+                if ui.state.config.alerts_enabled {
+                    ui.notifier.ensure_authorized();
+                    ui.alert_tracker.seed_baseline(
+                        ui.state.claude.snapshot.as_ref(),
+                        ui.state.codex.snapshot.as_ref(),
+                        &ui.state.config,
+                        unix_now_secs(),
+                    );
+                }
+                ui.persist_config();
+                ui.render(mtm);
+            }
+        }
+        MenuAction::SetWarningThreshold(pct) => {
+            if let Some(ui) = ui_cell.borrow_mut().as_mut()
+                && ui.state.config.set_warning_threshold(pct).is_ok()
+            {
+                ui.persist_config();
+                ui.render(mtm);
+            }
+        }
+        MenuAction::SetCriticalThreshold(pct) => {
+            if let Some(ui) = ui_cell.borrow_mut().as_mut()
+                && ui.state.config.set_critical_threshold(pct).is_ok()
+            {
+                ui.persist_config();
+                ui.render(mtm);
+            }
+        }
         MenuAction::ToggleLaunchAtLogin => {
             if let Some(ui) = ui_cell.borrow_mut().as_mut() {
                 let desired = !ui.state.config.launch_at_login;
@@ -308,25 +411,27 @@ fn handle_menu_action(ui_cell: &Rc<RefCell<Option<MainThreadUi>>>, action: MenuA
     }
 }
 
-/// Non-blocking AppKit smoke test verifying real `NSStatusItem`, `NSMenu`, and `WorkspaceObserver` on macOS.
+/// Non-blocking AppKit smoke test verifying real `NSStatusItem`, `NSMenu`, reset sub-lines,
+/// `WorkspaceObserver`, and bundle-guarded `NotificationSender` on macOS.
 pub fn run_ui_smoke_test() -> Result<()> {
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| AppError::InvalidConfig("UI smoke test must run on main thread".into()))?;
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
-    let config = AppConfig::default();
+    let now = 1_005;
+    let mut config = AppConfig::default();
     let mut claude = ProviderState::new(Provider::Claude);
     claude.apply_success(
         QuotaSnapshot {
             provider: Provider::Claude,
             five_hour: Some(QuotaWindow {
                 remaining_percent: 65,
-                resets_at: Some(1_795_239_600),
+                resets_at: Some(now + 2 * 3600 + 15 * 60),
             }),
             weekly: Some(QuotaWindow {
                 remaining_percent: 72,
-                resets_at: Some(1_795_788_000),
+                resets_at: Some(now + 4 * 86_400 + 6 * 3600),
             }),
             fetched_at: 1_000,
         },
@@ -338,18 +443,18 @@ pub fn run_ui_smoke_test() -> Result<()> {
             provider: Provider::Codex,
             five_hour: Some(QuotaWindow {
                 remaining_percent: 43,
-                resets_at: Some(1_795_238_616),
+                resets_at: Some(now + 48 * 60),
             }),
             weekly: Some(QuotaWindow {
                 remaining_percent: 31,
-                resets_at: Some(1_795_767_342),
+                resets_at: Some(now + 5 * 86_400 + 11 * 3600),
             }),
             fetched_at: 1_000,
         },
         1_000,
     );
 
-    let snap = UiSnapshot::build(&config, &claude, &codex, false, 1_005);
+    let snap = UiSnapshot::build(&config, &claude, &codex, false, now);
 
     let mut status_bar = StatusBarView::new(mtm);
     let mut dropdown = DropdownMenu::new(mtm, |_| {});
@@ -361,6 +466,21 @@ pub fn run_ui_smoke_test() -> Result<()> {
     let observer = WorkspaceObserver::register(mtm, Arc::clone(&scheduler));
     observer.unregister();
     scheduler.shutdown();
+
+    // Verify NotificationSender safely no-ops when invoked outside a `.app` bundle.
+    let mut notifier = NotificationSender::new();
+    if !notifier.is_bundle_available() {
+        notifier.send(
+            &QuotaAlert {
+                provider: Provider::Claude,
+                window: WindowKind::FiveHour,
+                level: AlertLevel::Warning,
+                remaining_percent: 15,
+                resets_at: Some(now + 3600),
+            },
+            now,
+        );
+    }
 
     // First apply mutates AppKit; identical second apply is a no-op (update-on-change).
     assert!(status_bar.apply(&snap, mtm));
@@ -375,9 +495,29 @@ pub fn run_ui_smoke_test() -> Result<()> {
 
     assert_eq!(sb_info.title_len, 12, "expected 5 + 2(spaces) + 5 chars");
     assert!(sb_info.width_pt > 40.0 && sb_info.width_pt < 120.0);
-    assert!(menu_info.top_level_items >= 8);
+    assert!(menu_info.top_level_items >= 10);
+    assert_eq!(menu_info.header_right_text, "Updated just now");
     assert_eq!(menu_info.claude_row_text, "● Claude\t65% / 72%");
+    assert_eq!(
+        menu_info.claude_reset_text.as_deref(),
+        Some("Reset in\t2h 15m / 4d 6h")
+    );
     assert_eq!(menu_info.codex_row_text, "● Codex\t43% / 31%");
+    assert_eq!(
+        menu_info.codex_reset_text.as_deref(),
+        Some("Reset in\t48m / 5d 11h")
+    );
+    // Verify exact vertical alignment of provider name == `Reset in` and flush-right values.
+    assert!((menu_info.provider_name_x - menu_info.reset_label_x).abs() < 0.01);
+    assert!((menu_info.provider_value_right_x - menu_info.reset_value_right_x).abs() < 0.01);
+
+    // Verify hiding reset times hides sub-lines cleanly.
+    config.show_reset_time = false;
+    let hidden_reset_snap = UiSnapshot::build(&config, &claude, &codex, false, now);
+    assert!(dropdown.apply(&hidden_reset_snap));
+    let hidden_info = dropdown.debug_inspect();
+    assert!(hidden_info.claude_reset_text.is_none());
+    assert!(hidden_info.codex_reset_text.is_none());
 
     // Verify stale/partial transition mutates cleanly.
     let partial_snap = UiSnapshot::build(&config, &claude, &codex, true, 2_500);
@@ -385,12 +525,14 @@ pub fn run_ui_smoke_test() -> Result<()> {
     assert!(dropdown.apply(&partial_snap));
 
     println!(
-        "UI smoke test OK: status_bar={}ptx{}pt (len={}), menu_items={}, claude={:?}, codex={:?}",
+        "UI smoke test OK: status_bar={}ptx{}pt (len={}), menu_items={}, header_right={:?}, claude={:?}, claude_reset={:?}, codex={:?}",
         sb_info.width_pt,
         sb_info.height_pt,
         sb_info.title_len,
         menu_info.top_level_items,
+        menu_info.header_right_text,
         menu_info.claude_row_text,
+        menu_info.claude_reset_text,
         menu_info.codex_row_text
     );
 
