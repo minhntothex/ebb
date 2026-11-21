@@ -384,8 +384,9 @@ fn scheduler_claude_cache_changed_reads_only_claude_and_never_starves_codex() {
     };
     let (tx, rx) = mpsc::channel();
 
+    // Start with a long interval so Periodic cannot race the Claude-only assertions on loaded VMs.
     let sched = RefreshScheduler::start(
-        test_refresh_config(Duration::from_millis(120)),
+        test_refresh_config(Duration::from_secs(60)),
         fetcher,
         move |ev| {
             if let RefreshEvent::Completed(outcome) = ev {
@@ -398,27 +399,44 @@ fn scheduler_claude_cache_changed_reads_only_claude_and_never_starves_codex() {
         },
     );
 
-    // Fire ClaudeCacheChanged twice quickly: must NOT spawn/call Codex!
-    sched.request_refresh(RefreshReason::ClaudeCacheChanged);
-    let (r1, has_cl1, has_cx1) = rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    assert_eq!(r1, RefreshReason::ClaudeCacheChanged);
-    assert!(has_cl1);
-    assert!(!has_cx1);
-    assert_eq!(codex_calls.load(Ordering::SeqCst), 0);
+    // Fire ClaudeCacheChanged twice: must read ONLY Claude and never spawn/call Codex.
+    for _ in 0..2 {
+        sched.request_refresh(RefreshReason::ClaudeCacheChanged);
+        let (reason, has_cl, has_cx) = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(reason, RefreshReason::ClaudeCacheChanged);
+        assert!(has_cl);
+        assert!(!has_cx);
+        assert_eq!(codex_calls.load(Ordering::SeqCst), 0);
+    }
 
-    thread::sleep(Duration::from_millis(40));
-    sched.request_refresh(RefreshReason::ClaudeCacheChanged);
-    let (r2, _, has_cx2) = rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    assert_eq!(r2, RefreshReason::ClaudeCacheChanged);
-    assert!(!has_cx2);
-    assert_eq!(codex_calls.load(Ordering::SeqCst), 0);
-
-    // Periodic Codex refresh MUST still fire on schedule (~120ms from start), not starved!
-    let (r3, has_cl3, has_cx3) = rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    assert_eq!(r3, RefreshReason::Periodic);
-    assert!(has_cl3);
-    assert!(has_cx3);
-    assert_eq!(codex_calls.load(Ordering::SeqCst), 1);
+    // Now switch to a short periodic interval and stream ClaudeCacheChanged events faster than
+    // the interval; Periodic Codex refresh MUST still fire on schedule instead of being starved.
+    sched.update_config(test_refresh_config(Duration::from_millis(120)));
+    let mut saw_periodic = false;
+    for _ in 0..25 {
+        sched.request_refresh(RefreshReason::ClaudeCacheChanged);
+        thread::sleep(Duration::from_millis(25));
+        while let Ok((reason, has_cl, has_cx)) = rx.try_recv() {
+            assert!(has_cl);
+            if reason == RefreshReason::Periodic {
+                assert!(has_cx);
+                saw_periodic = true;
+            } else {
+                assert_eq!(reason, RefreshReason::ClaudeCacheChanged);
+                assert!(!has_cx);
+            }
+        }
+        if saw_periodic {
+            break;
+        }
+    }
+    if !saw_periodic {
+        let (reason, has_cl, has_cx) = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(reason, RefreshReason::Periodic);
+        assert!(has_cl);
+        assert!(has_cx);
+    }
+    assert!(codex_calls.load(Ordering::SeqCst) >= 1);
     assert!(claude_calls.load(Ordering::SeqCst) >= 3);
 
     sched.shutdown();
