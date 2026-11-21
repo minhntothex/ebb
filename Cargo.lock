@@ -31,10 +31,11 @@ dependencies = [
 
 [[package]]
 name = "ebb"
-version = "26.1.0"
+version = "26.2.0"
 dependencies = [
  "block2",
  "dispatch2",
+ "libc",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",

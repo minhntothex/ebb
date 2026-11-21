@@ -14,6 +14,7 @@ pub const DEFAULT_CODEX_STALE_AFTER_SECS: u64 = 180; // 3m (active poll source)
 pub const DEFAULT_SNAPSHOT_TTL_SECS: u64 = 21_600; // 6h max cache visibility
 pub const DEFAULT_SHOW_RESET_TIME: bool = true;
 pub const DEFAULT_ALERTS_ENABLED: bool = true;
+pub const DEFAULT_NOTIFY_ON_REFRESH: bool = true;
 pub const DEFAULT_ALERT_WARNING_THRESHOLD: u8 = 20;
 pub const DEFAULT_ALERT_CRITICAL_THRESHOLD: u8 = 5;
 
@@ -38,6 +39,7 @@ pub struct AppConfig {
     pub snapshot_ttl_seconds: u64,
     pub show_reset_time: bool,
     pub alerts_enabled: bool,
+    pub notify_on_refresh: bool,
     pub alert_warning_threshold: u8,
     pub alert_critical_threshold: u8,
 }
@@ -55,6 +57,7 @@ impl Default for AppConfig {
             snapshot_ttl_seconds: DEFAULT_SNAPSHOT_TTL_SECS,
             show_reset_time: DEFAULT_SHOW_RESET_TIME,
             alerts_enabled: DEFAULT_ALERTS_ENABLED,
+            notify_on_refresh: DEFAULT_NOTIFY_ON_REFRESH,
             alert_warning_threshold: DEFAULT_ALERT_WARNING_THRESHOLD,
             alert_critical_threshold: DEFAULT_ALERT_CRITICAL_THRESHOLD,
         }

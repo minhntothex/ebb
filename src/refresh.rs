@@ -17,6 +17,16 @@ pub enum RefreshReason {
     Periodic,
     Manual,
     Wake,
+    /// Dedicated fast-path triggered by `ClaudeCacheWatcher` when `claude-statusline-cache.json` changes.
+    /// Reads only the local Claude cache without spawning `codex app-server`.
+    ClaudeCacheChanged,
+}
+
+impl RefreshReason {
+    /// Whether this refresh cycle should also poll Codex (`false` for Claude-only cache watch fast-path).
+    pub const fn fetches_codex(self) -> bool {
+        !matches!(self, RefreshReason::ClaudeCacheChanged)
+    }
 }
 
 /// Worker-visible subset of configuration that affects refresh cadence and adapter execution.
@@ -314,6 +324,7 @@ fn merge_reason(existing: Option<RefreshReason>, incoming: RefreshReason) -> Ref
 
 fn reason_priority(reason: RefreshReason) -> u8 {
     match reason {
+        RefreshReason::ClaudeCacheChanged => 0,
         RefreshReason::Periodic => 1,
         RefreshReason::Startup => 2,
         RefreshReason::Wake => 3,
@@ -384,7 +395,7 @@ where
         } else {
             None
         };
-        let codex = if cfg.show_codex {
+        let codex = if cfg.show_codex && reason.fetches_codex() {
             Some(fetcher.fetch_codex(&cfg))
         } else {
             None
@@ -401,7 +412,11 @@ where
             let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
             state.in_flight = false;
             last_generation = state.config_generation;
-            next_periodic = Instant::now() + state.config.interval;
+            // Only reset the periodic Codex schedule on full refresh cycles so active Claude
+            // status-line bursts never starve Codex polling.
+            if reason.fetches_codex() {
+                next_periodic = Instant::now() + state.config.interval;
+            }
             !state.shutdown
         };
 

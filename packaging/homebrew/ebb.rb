@@ -1,6 +1,6 @@
 cask "ebb" do
-  version "26.1"
-  # Replace :no_check with the DMG sha256 from SHA256SUMS.txt after publishing the release.
+  version "26.2"
+  # Replace :no_check with the DMG sha256 from SHA256SUMS.txt (populated automatically in dist/ebb.rb on release).
   sha256 :no_check
 
   url "https://github.com/minhntothex/ebb/releases/download/#{version}/ebb-#{version}-macos-universal.dmg"

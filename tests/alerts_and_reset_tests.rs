@@ -2,10 +2,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ebb::alerts::{AlertLevel, AlertTracker, QuotaAlert, format_alert_copy};
+use ebb::alerts::{AlertKind, AlertLevel, AlertTracker, QuotaAlert, format_alert_copy};
 use ebb::config::{
     AppConfig, DEFAULT_ALERT_CRITICAL_THRESHOLD, DEFAULT_ALERT_WARNING_THRESHOLD,
-    DEFAULT_ALERTS_ENABLED, DEFAULT_SHOW_RESET_TIME,
+    DEFAULT_ALERTS_ENABLED, DEFAULT_NOTIFY_ON_REFRESH, DEFAULT_SHOW_RESET_TIME,
 };
 use ebb::error::AppError;
 use ebb::model::{Provider, ProviderState, QuotaSnapshot, QuotaWindow, WindowKind};
@@ -45,11 +45,11 @@ fn snap(
 }
 
 #[test]
-fn config_26_1_is_backward_compatible_with_26_0_and_validates_thresholds() {
+fn config_26_2_is_backward_compatible_with_26_0_and_26_1_and_validates_thresholds() {
     let dir = temp_dir("compat");
     let cfg_path = dir.join("config.json");
 
-    // Simulate a 26.0 config.json without any 26.1 alert/reset keys.
+    // Simulate a 26.0/26.1 config.json without `notify_on_refresh` or 26.1 keys.
     fs::write(
         &cfg_path,
         r#"{
@@ -64,6 +64,7 @@ fn config_26_1_is_backward_compatible_with_26_0_and_validates_thresholds() {
     let mut cfg = AppConfig::load_or_default(&cfg_path).unwrap();
     assert_eq!(cfg.show_reset_time, DEFAULT_SHOW_RESET_TIME);
     assert_eq!(cfg.alerts_enabled, DEFAULT_ALERTS_ENABLED);
+    assert_eq!(cfg.notify_on_refresh, DEFAULT_NOTIFY_ON_REFRESH);
     assert_eq!(cfg.alert_warning_threshold, DEFAULT_ALERT_WARNING_THRESHOLD);
     assert_eq!(
         cfg.alert_critical_threshold,
@@ -224,7 +225,7 @@ fn alert_tracker_deduplicates_escalates_resets_and_respects_baseline() {
         vec![QuotaAlert {
             provider: Provider::Claude,
             window: WindowKind::FiveHour,
-            level: AlertLevel::Critical,
+            kind: AlertKind::Low(AlertLevel::Critical),
             remaining_percent: 5,
             resets_at: reset_cycle_1,
         }]
@@ -240,7 +241,7 @@ fn alert_tracker_deduplicates_escalates_resets_and_respects_baseline() {
     );
     assert!(tracker.evaluate(&claude_2, &cfg, t0 + 180).is_empty());
 
-    // 5. New reset cycle (`reset_cycle_2`) resets deduplication and fires Warning again.
+    // 5. New reset cycle (`reset_cycle_2`) that is ALREADY low fires Warning (not fake Refreshed).
     let claude_new_cycle = snap(
         Provider::Claude,
         Some((18, reset_cycle_2)),
@@ -249,7 +250,65 @@ fn alert_tracker_deduplicates_escalates_resets_and_respects_baseline() {
     );
     let next_cycle_alerts = tracker.evaluate(&claude_new_cycle, &cfg, t0 + 8000);
     assert_eq!(next_cycle_alerts.len(), 1);
-    assert_eq!(next_cycle_alerts[0].level, AlertLevel::Warning);
+    assert_eq!(
+        next_cycle_alerts[0].kind,
+        AlertKind::Low(AlertLevel::Warning)
+    );
+}
+
+#[test]
+fn alert_tracker_emits_single_refreshed_notification_on_recovery() {
+    let mut cfg = AppConfig::default();
+    let mut tracker = AlertTracker::new();
+    let t0 = 50_000;
+    let cycle1 = Some(t0 + 3600);
+    let cycle2 = Some(t0 + 21_600);
+
+    // Normal high usage NEVER emits a Refreshed notification.
+    let healthy1 = snap(Provider::Claude, Some((95, cycle1)), None, t0);
+    let healthy2 = snap(Provider::Claude, Some((100, cycle2)), None, t0 + 4000);
+    assert!(tracker.evaluate(&healthy1, &cfg, t0).is_empty());
+    assert!(tracker.evaluate(&healthy2, &cfg, t0 + 4000).is_empty());
+
+    // Drop into Critical -> fires Low(Critical).
+    let critical = snap(Provider::Claude, Some((4, cycle2)), None, t0 + 5000);
+    let a1 = tracker.evaluate(&critical, &cfg, t0 + 5000);
+    assert_eq!(a1.len(), 1);
+    assert_eq!(a1[0].kind, AlertKind::Low(AlertLevel::Critical));
+
+    // Next reset cycle recovers to 100% -> emits Refreshed ONCE.
+    let cycle3 = Some(t0 + 39_600);
+    let refreshed_snap = snap(Provider::Claude, Some((100, cycle3)), None, t0 + 22_000);
+    let a2 = tracker.evaluate(&refreshed_snap, &cfg, t0 + 22_000);
+    assert_eq!(
+        a2,
+        vec![QuotaAlert {
+            provider: Provider::Claude,
+            window: WindowKind::FiveHour,
+            kind: AlertKind::Refreshed,
+            remaining_percent: 100,
+            resets_at: cycle3,
+        }]
+    );
+    assert_eq!(a2[0].notification_id(), "ebb.claude.5h.refreshed");
+    let (title, body) = format_alert_copy(&a2[0], t0 + 22_000);
+    assert_eq!(title, "Ebb — Claude 5h quota refreshed");
+    assert_eq!(body, "100% remaining · resets in 4h 53m");
+
+    // Repeated polls at 100% do NOT spam Refreshed again.
+    assert!(
+        tracker
+            .evaluate(&refreshed_snap, &cfg, t0 + 22_060)
+            .is_empty()
+    );
+
+    // Respects `notify_on_refresh = false` (still clears state, emits no Refreshed alert).
+    cfg.notify_on_refresh = false;
+    let low_again = snap(Provider::Claude, Some((15, cycle3)), None, t0 + 23_000);
+    assert_eq!(tracker.evaluate(&low_again, &cfg, t0 + 23_000).len(), 1);
+    let cycle4 = Some(t0 + 57_600);
+    let full_again = snap(Provider::Claude, Some((100, cycle4)), None, t0 + 40_000);
+    assert!(tracker.evaluate(&full_again, &cfg, t0 + 40_000).is_empty());
 }
 
 #[test]
@@ -267,10 +326,16 @@ fn alert_tracker_hysteresis_and_config_guards() {
     assert!(tracker.evaluate(&hover, &cfg, now + 60).is_empty());
     assert!(tracker.evaluate(&low, &cfg, now + 120).is_empty());
 
-    // Recovering to >= 25% clears state so next drop to <= 20% alerts again.
+    // Recovering to 25% clears hysteresis without firing Refreshed (< 80% when no resets_at change).
     let recovered = snap(Provider::Codex, Some((25, None)), None, now + 180);
     assert!(tracker.evaluate(&recovered, &cfg, now + 180).is_empty());
     assert_eq!(tracker.evaluate(&low, &cfg, now + 240).len(), 1);
+
+    // Strong recovery to 95% without `resets_at` DOES emit Refreshed once.
+    let full = snap(Provider::Codex, Some((95, None)), None, now + 260);
+    let ref_alerts = tracker.evaluate(&full, &cfg, now + 260);
+    assert_eq!(ref_alerts.len(), 1);
+    assert_eq!(ref_alerts[0].kind, AlertKind::Refreshed);
 
     // Disabled alerts or hidden provider emit nothing.
     cfg.alerts_enabled = false;
@@ -286,7 +351,7 @@ fn alert_tracker_hysteresis_and_config_guards() {
         &QuotaAlert {
             provider: Provider::Claude,
             window: WindowKind::FiveHour,
-            level: AlertLevel::Warning,
+            kind: AlertKind::Low(AlertLevel::Warning),
             remaining_percent: 15,
             resets_at: Some(now + 2 * 3600 + 15 * 60),
         },
@@ -299,7 +364,7 @@ fn alert_tracker_hysteresis_and_config_guards() {
         &QuotaAlert {
             provider: Provider::Codex,
             window: WindowKind::Weekly,
-            level: AlertLevel::Critical,
+            kind: AlertKind::Low(AlertLevel::Critical),
             remaining_percent: 4,
             resets_at: None,
         },

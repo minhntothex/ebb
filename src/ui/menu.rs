@@ -39,10 +39,12 @@ pub enum MenuAction {
     ToggleShowCodex,
     ToggleShowResetTime,
     ToggleAlerts,
+    ToggleNotifyOnRefresh,
     SetWarningThreshold(u8),
     SetCriticalThreshold(u8),
     ToggleLaunchAtLogin,
     OpenConfigFolder,
+    CheckForUpdates,
     Quit,
 }
 
@@ -107,6 +109,11 @@ define_class!(
             self.dispatch(MenuAction::ToggleAlerts);
         }
 
+        #[unsafe(method(onToggleNotifyOnRefresh:))]
+        fn on_toggle_notify_on_refresh(&self, _sender: Option<&AnyObject>) {
+            self.dispatch(MenuAction::ToggleNotifyOnRefresh);
+        }
+
         #[unsafe(method(onSetWarning30:))]
         fn on_set_warning_30(&self, _sender: Option<&AnyObject>) {
             self.dispatch(MenuAction::SetWarningThreshold(30));
@@ -155,6 +162,11 @@ define_class!(
         #[unsafe(method(onOpenConfigFolder:))]
         fn on_open_config_folder(&self, _sender: Option<&AnyObject>) {
             self.dispatch(MenuAction::OpenConfigFolder);
+        }
+
+        #[unsafe(method(onCheckForUpdates:))]
+        fn on_check_for_updates(&self, _sender: Option<&AnyObject>) {
+            self.dispatch(MenuAction::CheckForUpdates);
         }
 
         #[unsafe(method(onQuit:))]
@@ -231,6 +243,7 @@ pub struct DropdownMenu {
     show_codex_item: Retained<NSMenuItem>,
     show_reset_time_item: Retained<NSMenuItem>,
     alerts_enabled_item: Retained<NSMenuItem>,
+    notify_on_refresh_item: Retained<NSMenuItem>,
     warning_threshold_items: Vec<(u8, Retained<NSMenuItem>)>,
     critical_threshold_items: Vec<(u8, Retained<NSMenuItem>)>,
     launch_at_login_item: Retained<NSMenuItem>,
@@ -326,7 +339,15 @@ impl DropdownMenu {
 
         let alerts_enabled_item =
             make_action_item(mtm, "Enabled", "", &target, sel!(onToggleAlerts:));
+        let notify_on_refresh_item = make_action_item(
+            mtm,
+            "Notify on Reset",
+            "",
+            &target,
+            sel!(onToggleNotifyOnRefresh:),
+        );
         alerts_menu.addItem(&alerts_enabled_item);
+        alerts_menu.addItem(&notify_on_refresh_item);
         alerts_menu.addItem(&NSMenuItem::separatorItem(mtm));
 
         let warning_parent = make_static_item(mtm, "Warning Threshold");
@@ -394,6 +415,15 @@ impl DropdownMenu {
         );
         settings_menu.addItem(&open_folder_item);
 
+        let check_updates_item = make_action_item(
+            mtm,
+            "Check for Updates…",
+            "",
+            &target,
+            sel!(onCheckForUpdates:),
+        );
+        settings_menu.addItem(&check_updates_item);
+
         settings_item.setSubmenu(Some(&settings_menu));
         menu.addItem(&settings_item);
 
@@ -415,6 +445,7 @@ impl DropdownMenu {
             show_codex_item,
             show_reset_time_item,
             alerts_enabled_item,
+            notify_on_refresh_item,
             warning_threshold_items,
             critical_threshold_items,
             launch_at_login_item,
@@ -467,6 +498,10 @@ impl DropdownMenu {
 
         self.alerts_enabled_item
             .setState(control_state(snapshot.alerts_enabled));
+        self.notify_on_refresh_item
+            .setState(control_state(snapshot.notify_on_refresh));
+        self.notify_on_refresh_item
+            .setEnabled(snapshot.alerts_enabled);
         for &(pct, ref item) in &self.warning_threshold_items {
             item.setState(control_state(pct == snapshot.alert_warning_threshold));
             item.setEnabled(snapshot.alerts_enabled);

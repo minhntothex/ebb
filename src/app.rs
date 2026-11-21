@@ -3,6 +3,7 @@ use std::process::Command;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dispatch2::DispatchQueue;
@@ -10,12 +11,13 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, sel};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSWorkspace, NSWorkspaceDidWakeNotification,
-    NSWorkspaceWillSleepNotification,
+    NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSApplication, NSApplicationActivationPolicy,
+    NSWorkspace, NSWorkspaceDidWakeNotification, NSWorkspaceWillSleepNotification,
 };
-use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol};
+use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSString};
 
-use crate::alerts::{AlertLevel, AlertTracker, QuotaAlert};
+use crate::APP_VERSION;
+use crate::alerts::{AlertKind, AlertLevel, AlertTracker, QuotaAlert};
 use crate::config::{AppConfig, AppPaths};
 use crate::error::{AppError, Result};
 use crate::launch_agent::LaunchAgentManager;
@@ -28,6 +30,8 @@ use crate::ui::menu::{DropdownMenu, MenuAction};
 use crate::ui::notifications::NotificationSender;
 use crate::ui::status_bar::StatusBarView;
 use crate::ui::view_model::UiSnapshot;
+use crate::updates::{UpdateCheckResult, check_latest_release};
+use crate::watcher::ClaudeCacheWatcher;
 
 struct WorkspaceObserverIvars {
     scheduler: Arc<RefreshScheduler>,
@@ -97,6 +101,8 @@ struct MainThreadUi {
     alert_tracker: AlertTracker,
     notifier: NotificationSender,
     scheduler: Arc<RefreshScheduler>,
+    claude_watcher: Option<ClaudeCacheWatcher>,
+    update_check_in_flight: Arc<AtomicBool>,
     ui_alive: Arc<AtomicBool>,
     workspace_observer: Retained<WorkspaceObserver>,
     status_bar: StatusBarView,
@@ -156,6 +162,9 @@ impl MainThreadUi {
     fn shutdown(&self) {
         self.ui_alive.store(false, Ordering::Release);
         self.workspace_observer.unregister();
+        if let Some(ref watcher) = self.claude_watcher {
+            watcher.shutdown();
+        }
         self.scheduler.shutdown();
         self.status_bar.remove();
     }
@@ -233,9 +242,11 @@ pub fn run_menu_bar_app() -> Result<()> {
                 let cell = unsafe { &*(target_ptr.0 as *const RefCell<Option<MainThreadUi>>) };
                 if let Some(ui) = cell.borrow_mut().as_mut() {
                     match event {
-                        RefreshEvent::Started(_reason) => {
-                            ui.state.mark_refresh_started();
-                            ui.render(mtm);
+                        RefreshEvent::Started(reason) => {
+                            if reason.fetches_codex() {
+                                ui.state.mark_refresh_started();
+                                ui.render(mtm);
+                            }
                         }
                         RefreshEvent::Completed(outcome) => {
                             let completed_at = outcome.completed_at;
@@ -269,6 +280,13 @@ pub fn run_menu_bar_app() -> Result<()> {
 
     let workspace_observer = WorkspaceObserver::register(mtm, Arc::clone(&scheduler));
 
+    // Zero-CPU macOS kqueue watcher for instant Claude status-line updates.
+    let watch_sched = Arc::clone(&scheduler);
+    let claude_watcher = ClaudeCacheWatcher::start(paths.claude_cache_path.clone(), move || {
+        watch_sched.request_refresh(RefreshReason::ClaudeCacheChanged);
+    })
+    .ok();
+
     let action_cell = Rc::clone(&ui_cell);
     let status_bar = StatusBarView::new(mtm);
     let dropdown = DropdownMenu::new(mtm, move |action| {
@@ -282,6 +300,8 @@ pub fn run_menu_bar_app() -> Result<()> {
         alert_tracker,
         notifier,
         scheduler: Arc::clone(&scheduler),
+        claude_watcher,
+        update_check_in_flight: Arc::new(AtomicBool::new(false)),
         ui_alive,
         workspace_observer,
         status_bar,
@@ -360,6 +380,13 @@ fn handle_menu_action(ui_cell: &Rc<RefCell<Option<MainThreadUi>>>, action: MenuA
                 ui.render(mtm);
             }
         }
+        MenuAction::ToggleNotifyOnRefresh => {
+            if let Some(ui) = ui_cell.borrow_mut().as_mut() {
+                ui.state.config.notify_on_refresh = !ui.state.config.notify_on_refresh;
+                ui.persist_config();
+                ui.render(mtm);
+            }
+        }
         MenuAction::SetWarningThreshold(pct) => {
             if let Some(ui) = ui_cell.borrow_mut().as_mut()
                 && ui.state.config.set_warning_threshold(pct).is_ok()
@@ -399,6 +426,28 @@ fn handle_menu_action(ui_cell: &Rc<RefCell<Option<MainThreadUi>>>, action: MenuA
                 let _ = Command::new("/usr/bin/open")
                     .arg(&ui.paths.base_dir)
                     .spawn();
+            }
+        }
+        MenuAction::CheckForUpdates => {
+            let in_flight = ui_cell
+                .borrow()
+                .as_ref()
+                .map(|ui| Arc::clone(&ui.update_check_in_flight));
+            if let Some(flag) = in_flight
+                && flag
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                let done_flag = Arc::clone(&flag);
+                thread::spawn(move || {
+                    let result = check_latest_release(APP_VERSION);
+                    DispatchQueue::main().exec_async(move || {
+                        done_flag.store(false, Ordering::Release);
+                        if let Some(mtm) = MainThreadMarker::new() {
+                            present_update_dialog(mtm, result);
+                        }
+                    });
+                });
             }
         }
         MenuAction::Quit => {
@@ -474,12 +523,28 @@ pub fn run_ui_smoke_test() -> Result<()> {
             &QuotaAlert {
                 provider: Provider::Claude,
                 window: WindowKind::FiveHour,
-                level: AlertLevel::Warning,
+                kind: AlertKind::Low(AlertLevel::Warning),
                 remaining_percent: 15,
                 resets_at: Some(now + 3600),
             },
             now,
         );
+        notifier.send(
+            &QuotaAlert {
+                provider: Provider::Claude,
+                window: WindowKind::FiveHour,
+                kind: AlertKind::Refreshed,
+                remaining_percent: 100,
+                resets_at: Some(now + 18_000),
+            },
+            now,
+        );
+    }
+
+    // Verify ClaudeCacheWatcher starts and shuts down cleanly without leaks.
+    let smoke_watch_path = std::env::temp_dir().join("ebb-smoke-claude-cache.json");
+    if let Ok(watcher) = ClaudeCacheWatcher::start(smoke_watch_path, || {}) {
+        watcher.shutdown();
     }
 
     // First apply mutates AppKit; identical second apply is a no-op (update-on-change).
@@ -538,6 +603,50 @@ pub fn run_ui_smoke_test() -> Result<()> {
 
     status_bar.remove();
     Ok(())
+}
+
+fn present_update_dialog(
+    mtm: MainThreadMarker,
+    result: std::result::Result<UpdateCheckResult, String>,
+) {
+    let app = NSApplication::sharedApplication(mtm);
+    app.activate();
+
+    let alert = NSAlert::new(mtm);
+    match result {
+        Ok(UpdateCheckResult::UpdateAvailable {
+            current,
+            latest,
+            release_url,
+        }) => {
+            alert.setAlertStyle(NSAlertStyle::Informational);
+            alert.setMessageText(&NSString::from_str(&format!("Ebb {latest} is available")));
+            alert.setInformativeText(&NSString::from_str(&format!(
+                "You are running Ebb {current}. Download the latest Universal build from GitHub Releases."
+            )));
+            alert.addButtonWithTitle(&NSString::from_str("Open Release Page"));
+            alert.addButtonWithTitle(&NSString::from_str("Later"));
+            if alert.runModal() == NSAlertFirstButtonReturn {
+                let _ = Command::new("/usr/bin/open").arg(&release_url).spawn();
+            }
+        }
+        Ok(UpdateCheckResult::UpToDate { current, .. }) => {
+            alert.setAlertStyle(NSAlertStyle::Informational);
+            alert.setMessageText(&NSString::from_str("Ebb is up to date"));
+            alert.setInformativeText(&NSString::from_str(&format!(
+                "Ebb {current} is currently the newest version available."
+            )));
+            alert.addButtonWithTitle(&NSString::from_str("OK"));
+            let _ = alert.runModal();
+        }
+        Err(err) => {
+            alert.setAlertStyle(NSAlertStyle::Warning);
+            alert.setMessageText(&NSString::from_str("Unable to check for updates"));
+            alert.setInformativeText(&NSString::from_str(&err));
+            alert.addButtonWithTitle(&NSString::from_str("OK"));
+            let _ = alert.runModal();
+        }
+    }
 }
 
 fn unix_now_secs() -> u64 {

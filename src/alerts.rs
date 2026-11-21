@@ -8,6 +8,10 @@ use crate::ui::view_model::format_reset_countdown;
 /// when `resets_at` is unavailable, preventing boundary flapping.
 pub const ALERT_RECOVERY_HYSTERESIS: u8 = 5;
 
+/// Minimum remaining percentage required to emit a `Refreshed` recovery notification
+/// when `resets_at` did not change (for example, snapshots without `resets_at`).
+pub const REFRESH_RECOVERY_MIN_PERCENT: u8 = 80;
+
 /// Severity level for a low-quota alert (`Warning < Critical` for escalation checks).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AlertLevel {
@@ -24,12 +28,28 @@ impl AlertLevel {
     }
 }
 
-/// Actionable low-quota alert emitted by `AlertTracker`.
+/// Kind of quota notification emitted by `AlertTracker`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AlertKind {
+    Low(AlertLevel),
+    Refreshed,
+}
+
+impl AlertKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            AlertKind::Low(level) => level.as_str(),
+            AlertKind::Refreshed => "refreshed",
+        }
+    }
+}
+
+/// Actionable quota notification emitted by `AlertTracker`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuotaAlert {
     pub provider: Provider,
     pub window: WindowKind,
-    pub level: AlertLevel,
+    pub kind: AlertKind,
     pub remaining_percent: u8,
     pub resets_at: Option<u64>,
 }
@@ -45,7 +65,7 @@ impl QuotaAlert {
             WindowKind::FiveHour => "5h",
             WindowKind::Weekly => "weekly",
         };
-        format!("ebb.{provider}.{window}.{}", self.level.as_str())
+        format!("ebb.{provider}.{window}.{}", self.kind.as_str())
     }
 }
 
@@ -56,14 +76,16 @@ struct FiredWindowState {
     fired_at: u64,
 }
 
-/// Pure-Rust per-window low-quota alert state machine with anti-spam deduplication.
+/// Pure-Rust per-window quota alert state machine with anti-spam deduplication and recovery alerts.
 ///
 /// Rules:
-/// - Baseline seeding on startup suppresses stale replay notifications.
-/// - Fires at most once per `(Provider, WindowKind, AlertLevel)` per `resets_at` cycle.
+/// - Baseline seeding on startup suppresses stale replay notifications while tracking already-low
+///   windows so they can still emit a `Refreshed` notification once their cycle resets.
+/// - Low alerts fire at most once per `(Provider, WindowKind, AlertLevel)` per `resets_at` cycle.
 /// - Allows upward severity escalation (`Warning -> Critical`) inside the same cycle.
-/// - Clears automatically when `resets_at` advances to a new cycle OR when remaining recovers
-///   above `alert_warning_threshold + ALERT_RECOVERY_HYSTERESIS`.
+/// - When a previously low/critical window recovers into a new reset cycle (or jumps to `>= 80%`
+///   without `resets_at`), clears the low state and emits at most one `Refreshed` notification
+///   when `cfg.notify_on_refresh` is enabled.
 #[derive(Debug, Default, Clone)]
 pub struct AlertTracker {
     fired: HashMap<(Provider, WindowKind), FiredWindowState>,
@@ -139,20 +161,36 @@ impl AlertTracker {
     ) -> Option<QuotaAlert> {
         let key = (provider, window_kind);
         let target_level = classify_level(window.remaining_percent, cfg);
+        let recovery_cutoff = cfg
+            .alert_warning_threshold
+            .saturating_add(ALERT_RECOVERY_HYSTERESIS)
+            .min(100);
 
         if let Some(&prev) = self.fired.get(&key) {
             let new_reset_cycle = matches!(
                 (prev.resets_at, window.resets_at),
                 (Some(old_ts), Some(new_ts)) if old_ts != new_ts
             );
-            let recovery_cutoff = cfg
-                .alert_warning_threshold
-                .saturating_add(ALERT_RECOVERY_HYSTERESIS)
-                .min(100);
             let recovered = target_level.is_none() && window.remaining_percent >= recovery_cutoff;
 
             if new_reset_cycle || recovered {
                 self.fired.remove(&key);
+
+                // Emit one calm recovery notification if the window is now genuinely healthy
+                // (new reset cycle above recovery cutoff, OR strong recovery >= 80% without `resets_at`).
+                let strong_recovery = window.remaining_percent >= REFRESH_RECOVERY_MIN_PERCENT;
+                if target_level.is_none()
+                    && cfg.notify_on_refresh
+                    && ((new_reset_cycle && recovered) || (!new_reset_cycle && strong_recovery))
+                {
+                    return Some(QuotaAlert {
+                        provider,
+                        window: window_kind,
+                        kind: AlertKind::Refreshed,
+                        remaining_percent: window.remaining_percent,
+                        resets_at: window.resets_at,
+                    });
+                }
             }
         }
 
@@ -178,7 +216,7 @@ impl AlertTracker {
         Some(QuotaAlert {
             provider,
             window: window_kind,
-            level,
+            kind: AlertKind::Low(level),
             remaining_percent: window.remaining_percent,
             resets_at: window.resets_at,
         })
@@ -204,11 +242,18 @@ fn provider_visible(provider: Provider, cfg: &AppConfig) -> bool {
 
 /// Format crisp `(title, body)` copy for a macOS notification.
 pub fn format_alert_copy(alert: &QuotaAlert, now_secs: u64) -> (String, String) {
-    let severity = match alert.level {
-        AlertLevel::Warning => "low",
-        AlertLevel::Critical => "critical",
+    let title = match alert.kind {
+        AlertKind::Low(AlertLevel::Warning) => {
+            format!("Ebb — {} {} quota low", alert.provider, alert.window)
+        }
+        AlertKind::Low(AlertLevel::Critical) => {
+            format!("Ebb — {} {} quota critical", alert.provider, alert.window)
+        }
+        AlertKind::Refreshed => {
+            format!("Ebb — {} {} quota refreshed", alert.provider, alert.window)
+        }
     };
-    let title = format!("Ebb — {} {} quota {severity}", alert.provider, alert.window);
+
     let body = match alert.resets_at {
         Some(ts) => {
             let countdown = format_reset_countdown(now_secs, ts);

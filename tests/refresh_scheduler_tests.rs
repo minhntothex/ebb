@@ -327,3 +327,202 @@ fn launch_agent_plist_install_uninstall_and_xml_escaping() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+struct SplitCountFetcher {
+    claude_calls: Arc<AtomicUsize>,
+    codex_calls: Arc<AtomicUsize>,
+    use_real_claude_cache: bool,
+}
+
+impl QuotaFetcher for SplitCountFetcher {
+    fn fetch_claude(&self, cfg: &RefreshConfig) -> Result<Option<QuotaSnapshot>> {
+        self.claude_calls.fetch_add(1, Ordering::SeqCst);
+        if self.use_real_claude_cache {
+            ebb::providers::claude::ClaudeAdapter::new(cfg.claude_cache_path.clone())
+                .read_snapshot()
+        } else {
+            Ok(Some(QuotaSnapshot {
+                provider: Provider::Claude,
+                five_hour: Some(QuotaWindow {
+                    remaining_percent: 82,
+                    resets_at: None,
+                }),
+                weekly: Some(QuotaWindow {
+                    remaining_percent: 97,
+                    resets_at: None,
+                }),
+                fetched_at: 10_000,
+            }))
+        }
+    }
+
+    fn fetch_codex(&self, _cfg: &RefreshConfig) -> Result<QuotaSnapshot> {
+        self.codex_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(QuotaSnapshot {
+            provider: Provider::Codex,
+            five_hour: Some(QuotaWindow {
+                remaining_percent: 78,
+                resets_at: None,
+            }),
+            weekly: Some(QuotaWindow {
+                remaining_percent: 81,
+                resets_at: None,
+            }),
+            fetched_at: 10_000,
+        })
+    }
+}
+
+#[test]
+fn scheduler_claude_cache_changed_reads_only_claude_and_never_starves_codex() {
+    let claude_calls = Arc::new(AtomicUsize::new(0));
+    let codex_calls = Arc::new(AtomicUsize::new(0));
+    let fetcher = SplitCountFetcher {
+        claude_calls: Arc::clone(&claude_calls),
+        codex_calls: Arc::clone(&codex_calls),
+        use_real_claude_cache: false,
+    };
+    let (tx, rx) = mpsc::channel();
+
+    let sched = RefreshScheduler::start(
+        test_refresh_config(Duration::from_millis(120)),
+        fetcher,
+        move |ev| {
+            if let RefreshEvent::Completed(outcome) = ev {
+                let _ = tx.send((
+                    outcome.reason,
+                    outcome.claude.is_some(),
+                    outcome.codex.is_some(),
+                ));
+            }
+        },
+    );
+
+    // Fire ClaudeCacheChanged twice quickly: must NOT spawn/call Codex!
+    sched.request_refresh(RefreshReason::ClaudeCacheChanged);
+    let (r1, has_cl1, has_cx1) = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(r1, RefreshReason::ClaudeCacheChanged);
+    assert!(has_cl1);
+    assert!(!has_cx1);
+    assert_eq!(codex_calls.load(Ordering::SeqCst), 0);
+
+    thread::sleep(Duration::from_millis(40));
+    sched.request_refresh(RefreshReason::ClaudeCacheChanged);
+    let (r2, _, has_cx2) = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(r2, RefreshReason::ClaudeCacheChanged);
+    assert!(!has_cx2);
+    assert_eq!(codex_calls.load(Ordering::SeqCst), 0);
+
+    // Periodic Codex refresh MUST still fire on schedule (~120ms from start), not starved!
+    let (r3, has_cl3, has_cx3) = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(r3, RefreshReason::Periodic);
+    assert!(has_cl3);
+    assert!(has_cx3);
+    assert_eq!(codex_calls.load(Ordering::SeqCst), 1);
+    assert!(claude_calls.load(Ordering::SeqCst) >= 3);
+
+    sched.shutdown();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn kqueue_watcher_detects_atomic_renames_ignores_unrelated_and_triggers_claude_only() {
+    use ebb::providers::claude::write_claude_cache_atomic;
+    use ebb::watcher::ClaudeCacheWatcher;
+    use std::time::Instant;
+
+    let dir = temp_dir("kqueue");
+    let cache_path = dir.join("claude-statusline-cache.json");
+    let unrelated_path = dir.join("usage-cache.json");
+
+    let claude_calls = Arc::new(AtomicUsize::new(0));
+    let codex_calls = Arc::new(AtomicUsize::new(0));
+    let fetcher = SplitCountFetcher {
+        claude_calls: Arc::clone(&claude_calls),
+        codex_calls: Arc::clone(&codex_calls),
+        use_real_claude_cache: true,
+    };
+
+    let (tx, rx) = mpsc::channel();
+    let cfg = RefreshConfig {
+        interval: Duration::from_secs(60),
+        show_claude: true,
+        show_codex: true,
+        claude_cache_path: cache_path.clone(),
+        codex_path: None,
+    };
+    let sched = Arc::new(RefreshScheduler::start(cfg, fetcher, move |ev| {
+        if let RefreshEvent::Completed(outcome) = ev {
+            let rem = outcome
+                .claude
+                .and_then(|r| r.ok())
+                .flatten()
+                .and_then(|s| s.five_hour)
+                .map(|w| w.remaining_percent);
+            let _ = tx.send((outcome.reason, rem, outcome.codex.is_some()));
+        }
+    }));
+
+    let watch_sched = Arc::clone(&sched);
+    let watcher = ClaudeCacheWatcher::start(cache_path.clone(), move || {
+        watch_sched.request_refresh(RefreshReason::ClaudeCacheChanged);
+    })
+    .unwrap();
+
+    // 1. Unrelated file write in same directory must NOT trigger watcher.
+    fs::write(&unrelated_path, r#"{"version":1}"#).unwrap();
+    assert!(
+        rx.recv_timeout(Duration::from_millis(120)).is_err(),
+        "unrelated file write must not trigger Claude refresh"
+    );
+
+    // 2. First atomic Claude cache write triggers instant ClaudeOnly refresh (<500ms).
+    let snap1 = QuotaSnapshot {
+        provider: Provider::Claude,
+        five_hour: Some(QuotaWindow {
+            remaining_percent: 85,
+            resets_at: Some(1_795_239_600),
+        }),
+        weekly: Some(QuotaWindow {
+            remaining_percent: 97,
+            resets_at: Some(1_795_788_000),
+        }),
+        fetched_at: 20_000,
+    };
+    let t_write1 = Instant::now();
+    write_claude_cache_atomic(&cache_path, &snap1, 0).unwrap();
+    let (r1, rem1, has_cx1) = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(
+        t_write1.elapsed() < Duration::from_millis(500),
+        "instant watch took too long: {:?}",
+        t_write1.elapsed()
+    );
+    assert_eq!(r1, RefreshReason::ClaudeCacheChanged);
+    assert_eq!(rem1, Some(85));
+    assert!(!has_cx1);
+    assert_eq!(codex_calls.load(Ordering::SeqCst), 0);
+
+    // 3. Second atomic rename (identical byte length: 85 -> 84) MUST also fire via inode change.
+    let snap2 = QuotaSnapshot {
+        five_hour: Some(QuotaWindow {
+            remaining_percent: 84,
+            resets_at: Some(1_795_239_600),
+        }),
+        fetched_at: 20_010,
+        ..snap1
+    };
+    write_claude_cache_atomic(&cache_path, &snap2, 0).unwrap();
+    let (r2, rem2, has_cx2) = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(r2, RefreshReason::ClaudeCacheChanged);
+    assert_eq!(rem2, Some(84));
+    assert!(!has_cx2);
+    assert_eq!(codex_calls.load(Ordering::SeqCst), 0);
+
+    // 4. Clean, fast shutdown of watcher + scheduler (<200ms).
+    let t_stop = Instant::now();
+    watcher.shutdown();
+    sched.shutdown();
+    assert!(t_stop.elapsed() < Duration::from_millis(500));
+
+    let _ = fs::remove_dir_all(&dir);
+}

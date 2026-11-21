@@ -54,7 +54,7 @@ if [[ ! -x "${BIN_SRC}" ]]; then
 fi
 
 if [[ ! -f "${ICON_SRC}" ]]; then
-    echo "error: AppIcon.icns not found at ${ICON_SRC} (run scripts/generate-icon.swift)" >&2
+    echo "error: AppIcon.icns not found at ${ICON_SRC} (run scripts/generate-icon.sh)" >&2
     exit 1
 fi
 
