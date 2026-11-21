@@ -146,27 +146,55 @@ fn ui_snapshot_populates_reset_line_and_tooltip_without_altering_menu_bar() {
         now,
     );
 
-    let ui = UiSnapshot::build(&cfg, &claude, &codex, false, now);
+    let agy = ProviderState::new(Provider::Agy);
+    let ui = UiSnapshot::build(&cfg, &claude, &codex, &agy, false, now);
     // Menu bar stays strictly minimal numbers only.
     assert_eq!(ui.menu_bar_plain_text(), "65/72 43/31");
     assert_eq!(
-        ui.claude_row.reset_value_text.as_deref(),
+        ui.row_for(Provider::Claude).reset_value_text.as_deref(),
         Some("2h 15m / 4d 6h")
     );
     assert_eq!(
-        ui.codex_row.reset_value_text.as_deref(),
+        ui.row_for(Provider::Codex).reset_value_text.as_deref(),
         Some("resetting… / 5d 11h")
     );
-    assert!(ui.claude_row.tooltip.contains("5h resets in 2h 15m"));
-    assert!(ui.claude_row.tooltip.contains("weekly resets in 4d 6h"));
-    assert!(ui.codex_row.tooltip.contains("5h resetting…"));
+    assert!(
+        ui.row_for(Provider::Claude)
+            .tooltip
+            .contains("5h resets in 2h 15m")
+    );
+    assert!(
+        ui.row_for(Provider::Claude)
+            .tooltip
+            .contains("weekly resets in 4d 6h")
+    );
+    assert!(
+        ui.row_for(Provider::Codex)
+            .tooltip
+            .contains("5h resetting…")
+    );
 
     // Turning off `show_reset_time` hides dropdown sub-lines while keeping tooltip info.
     cfg.show_reset_time = false;
-    let ui_hidden = UiSnapshot::build(&cfg, &claude, &codex, false, now);
-    assert!(ui_hidden.claude_row.reset_value_text.is_none());
-    assert!(ui_hidden.codex_row.reset_value_text.is_none());
-    assert!(ui_hidden.claude_row.tooltip.contains("5h resets in 2h 15m"));
+    let ui_hidden = UiSnapshot::build(&cfg, &claude, &codex, &agy, false, now);
+    assert!(
+        ui_hidden
+            .row_for(Provider::Claude)
+            .reset_value_text
+            .is_none()
+    );
+    assert!(
+        ui_hidden
+            .row_for(Provider::Codex)
+            .reset_value_text
+            .is_none()
+    );
+    assert!(
+        ui_hidden
+            .row_for(Provider::Claude)
+            .tooltip
+            .contains("5h resets in 2h 15m")
+    );
 
     // Snapshot with no `resets_at` returns None.
     let no_reset = snap(Provider::Claude, Some((80, None)), Some((90, None)), now);
@@ -200,7 +228,7 @@ fn alert_tracker_deduplicates_escalates_resets_and_respects_baseline() {
         Some((80, Some(t0 + 86_400))),
         t0,
     );
-    tracker.seed_baseline(Some(&cached_claude), None, &cfg, t0);
+    tracker.seed_baseline(&[Some(&cached_claude), None], &cfg, t0);
     assert!(tracker.evaluate(&cached_claude, &cfg, t0 + 10).is_empty());
 
     // 2. Dropping from 15% -> 12% in same cycle still does NOT re-fire Warning.
@@ -345,6 +373,31 @@ fn alert_tracker_hysteresis_and_config_guards() {
     cfg.alerts_enabled = true;
     cfg.show_codex = false;
     assert!(tracker.evaluate(&crit, &cfg, now + 360).is_empty());
+
+    // Agy alerts respect `show_agy` and produce deterministic `ebb.agy.*` notification IDs.
+    let agy_low = snap(
+        Provider::Agy,
+        None,
+        Some((15, Some(now + 86_400))),
+        now + 400,
+    );
+    assert!(tracker.evaluate(&agy_low, &cfg, now + 400).is_empty());
+    cfg.show_agy = true;
+    let agy_alerts = tracker.evaluate(&agy_low, &cfg, now + 420);
+    assert_eq!(agy_alerts.len(), 1);
+    assert_eq!(agy_alerts[0].notification_id(), "ebb.agy.weekly.warning");
+    let agy_reset = snap(
+        Provider::Agy,
+        None,
+        Some((100, Some(now + 7 * 86_400))),
+        now + 90_000,
+    );
+    let agy_refreshed = tracker.evaluate(&agy_reset, &cfg, now + 90_000);
+    assert_eq!(agy_refreshed.len(), 1);
+    assert_eq!(
+        agy_refreshed[0].notification_id(),
+        "ebb.agy.weekly.refreshed"
+    );
 
     // Copy formatter produces clean title & body.
     let (title, body) = format_alert_copy(

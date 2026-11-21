@@ -1,16 +1,17 @@
 use std::cell::RefCell;
 
 use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
+use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, sel};
 use objc2_app_kit::{
     NSColor, NSControlStateValueOff, NSControlStateValueOn, NSFont, NSFontWeightRegular,
-    NSFontWeightSemibold, NSLineBreakMode, NSMenu, NSMenuItem, NSTextAlignment, NSTextField,
-    NSView,
+    NSFontWeightSemibold, NSLineBreakMode, NSMenu, NSMenuDelegate, NSMenuItem, NSTextAlignment,
+    NSTextField, NSView,
 };
 use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
-use crate::config::{CRITICAL_THRESHOLD_PRESETS, WARNING_THRESHOLD_PRESETS};
+use crate::config::{CRITICAL_THRESHOLD_PRESETS, ColorTheme, WARNING_THRESHOLD_PRESETS};
+use crate::model::{DisplayMetric, MenuBarWindows, Provider};
 use crate::ui::status_bar::provider_dynamic_color;
 use crate::ui::view_model::{
     INTERVAL_PRESETS, ProviderRowViewModel, UiSnapshot, format_interval_label,
@@ -19,7 +20,7 @@ use crate::ui::view_model::{
 const MENU_WIDTH_PT: f64 = 264.0;
 const OUTER_PAD_X: f64 = 14.0;
 const DOT_WIDTH_PT: f64 = 14.0;
-/// Left X coordinate shared by provider name (`Claude`/`Codex`) and `Reset in` for exact vertical alignment.
+/// Left X coordinate shared by provider name (`Claude`/`Codex`/`Agy`) and `Reset in` for exact vertical alignment.
 const PROVIDER_TEXT_X: f64 = OUTER_PAD_X + DOT_WIDTH_PT;
 const RIGHT_EDGE_X: f64 = MENU_WIDTH_PT - OUTER_PAD_X;
 
@@ -33,15 +34,24 @@ const SUBLINE_FONT_SIZE: f64 = 11.0;
 /// Actions emitted by the native `NSMenu` dropdown on the AppKit main thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
+    WillOpen,
     RefreshNow,
     SetIntervalSeconds(u64),
     ToggleShowClaude,
     ToggleShowCodex,
+    ToggleShowAgy,
     ToggleShowResetTime,
+    SetDisplayMetric(DisplayMetric),
+    SetMenuBarWindows(MenuBarWindows),
+    ToggleHighlightCritical,
+    MoveProviderFirst(Provider),
+    SetColorTheme(ColorTheme),
     ToggleAlerts,
     ToggleNotifyOnRefresh,
     SetWarningThreshold(u8),
     SetCriticalThreshold(u8),
+    SetupClaudeStatusline,
+    SetupAgyStatusline,
     ToggleLaunchAtLogin,
     OpenConfigFolder,
     CheckForUpdates,
@@ -62,6 +72,13 @@ define_class!(
     struct MenuTarget;
 
     unsafe impl NSObjectProtocol for MenuTarget {}
+
+    unsafe impl NSMenuDelegate for MenuTarget {
+        #[unsafe(method(menuWillOpen:))]
+        fn menu_will_open(&self, _menu: &NSMenu) {
+            self.dispatch(MenuAction::WillOpen);
+        }
+    }
 
     impl MenuTarget {
         #[unsafe(method(onRefreshNow:))]
@@ -99,9 +116,69 @@ define_class!(
             self.dispatch(MenuAction::ToggleShowCodex);
         }
 
+        #[unsafe(method(onToggleAgy:))]
+        fn on_toggle_agy(&self, _sender: Option<&AnyObject>) {
+            self.dispatch(MenuAction::ToggleShowAgy);
+        }
+
         #[unsafe(method(onToggleShowResetTime:))]
         fn on_toggle_show_reset_time(&self, _sender: Option<&AnyObject>) {
             self.dispatch(MenuAction::ToggleShowResetTime);
+        }
+
+        #[unsafe(method(onMetricRemaining:))]
+        fn on_metric_remaining(&self, _sender: Option<&AnyObject>) {
+            self.dispatch(MenuAction::SetDisplayMetric(DisplayMetric::Remaining));
+        }
+
+        #[unsafe(method(onMetricUsed:))]
+        fn on_metric_used(&self, _sender: Option<&AnyObject>) {
+            self.dispatch(MenuAction::SetDisplayMetric(DisplayMetric::Used));
+        }
+
+        #[unsafe(method(onWindowsBoth:))]
+        fn on_windows_both(&self, _sender: Option<&AnyObject>) {
+            self.dispatch(MenuAction::SetMenuBarWindows(MenuBarWindows::Both));
+        }
+
+        #[unsafe(method(onWindowsFiveHourOnly:))]
+        fn on_windows_five_hour_only(&self, _sender: Option<&AnyObject>) {
+            self.dispatch(MenuAction::SetMenuBarWindows(MenuBarWindows::FiveHourOnly));
+        }
+
+        #[unsafe(method(onToggleHighlightCritical:))]
+        fn on_toggle_highlight_critical(&self, _sender: Option<&AnyObject>) {
+            self.dispatch(MenuAction::ToggleHighlightCritical);
+        }
+
+        #[unsafe(method(onMoveClaudeFirst:))]
+        fn on_move_claude_first(&self, _sender: Option<&AnyObject>) {
+            self.dispatch(MenuAction::MoveProviderFirst(Provider::Claude));
+        }
+
+        #[unsafe(method(onMoveCodexFirst:))]
+        fn on_move_codex_first(&self, _sender: Option<&AnyObject>) {
+            self.dispatch(MenuAction::MoveProviderFirst(Provider::Codex));
+        }
+
+        #[unsafe(method(onMoveAgyFirst:))]
+        fn on_move_agy_first(&self, _sender: Option<&AnyObject>) {
+            self.dispatch(MenuAction::MoveProviderFirst(Provider::Agy));
+        }
+
+        #[unsafe(method(onThemeDefault:))]
+        fn on_theme_default(&self, _sender: Option<&AnyObject>) {
+            self.dispatch(MenuAction::SetColorTheme(ColorTheme::Default));
+        }
+
+        #[unsafe(method(onThemeHighContrast:))]
+        fn on_theme_high_contrast(&self, _sender: Option<&AnyObject>) {
+            self.dispatch(MenuAction::SetColorTheme(ColorTheme::HighContrast));
+        }
+
+        #[unsafe(method(onThemeMonochrome:))]
+        fn on_theme_monochrome(&self, _sender: Option<&AnyObject>) {
+            self.dispatch(MenuAction::SetColorTheme(ColorTheme::Monochrome));
         }
 
         #[unsafe(method(onToggleAlerts:))]
@@ -152,6 +229,16 @@ define_class!(
         #[unsafe(method(onSetCritical3:))]
         fn on_set_critical_3(&self, _sender: Option<&AnyObject>) {
             self.dispatch(MenuAction::SetCriticalThreshold(3));
+        }
+
+        #[unsafe(method(onSetupClaudeStatusline:))]
+        fn on_setup_claude_statusline(&self, _sender: Option<&AnyObject>) {
+            self.dispatch(MenuAction::SetupClaudeStatusline);
+        }
+
+        #[unsafe(method(onSetupAgyStatusline:))]
+        fn on_setup_agy_statusline(&self, _sender: Option<&AnyObject>) {
+            self.dispatch(MenuAction::SetupAgyStatusline);
         }
 
         #[unsafe(method(onToggleLaunchAtLogin:))]
@@ -213,11 +300,17 @@ struct ResetRowHandles {
     value_label: Retained<NSTextField>,
 }
 
+struct ProviderSlot {
+    row: ProviderRowHandles,
+    reset: ResetRowHandles,
+}
+
 /// Debug snapshot of native `NSMenu` structure used by `--ui-smoke-test`.
 #[derive(Debug, Clone)]
 pub struct MenuDebugInfo {
     pub top_level_items: isize,
     pub header_right_text: String,
+    pub visible_rows: Vec<(String, Option<String>)>,
     pub claude_row_text: String,
     pub claude_reset_text: Option<String>,
     pub codex_row_text: String,
@@ -231,21 +324,28 @@ pub struct MenuDebugInfo {
 /// Reused native `NSMenu` dropdown matching the compact Ebb specification.
 pub struct DropdownMenu {
     menu: Retained<NSMenu>,
-    _target: Retained<MenuTarget>,
+    target: Retained<MenuTarget>,
     header_row: HeaderRowHandles,
-    claude_row: ProviderRowHandles,
-    claude_reset_row: ResetRowHandles,
-    codex_row: ProviderRowHandles,
-    codex_reset_row: ResetRowHandles,
+    provider_slots: Vec<ProviderSlot>,
     refresh_item: Retained<NSMenuItem>,
     interval_items: Vec<(u64, Retained<NSMenuItem>)>,
     show_claude_item: Retained<NSMenuItem>,
     show_codex_item: Retained<NSMenuItem>,
+    show_agy_item: Retained<NSMenuItem>,
     show_reset_time_item: Retained<NSMenuItem>,
+    metric_remaining_item: Retained<NSMenuItem>,
+    metric_used_item: Retained<NSMenuItem>,
+    windows_both_item: Retained<NSMenuItem>,
+    windows_5h_item: Retained<NSMenuItem>,
+    highlight_critical_item: Retained<NSMenuItem>,
+    order_first_items: Vec<(Provider, Retained<NSMenuItem>)>,
+    theme_items: Vec<(ColorTheme, Retained<NSMenuItem>)>,
     alerts_enabled_item: Retained<NSMenuItem>,
     notify_on_refresh_item: Retained<NSMenuItem>,
     warning_threshold_items: Vec<(u8, Retained<NSMenuItem>)>,
     critical_threshold_items: Vec<(u8, Retained<NSMenuItem>)>,
+    setup_claude_item: Retained<NSMenuItem>,
+    setup_agy_item: Retained<NSMenuItem>,
     launch_at_login_item: Retained<NSMenuItem>,
     last_snapshot: Option<UiSnapshot>,
 }
@@ -260,22 +360,22 @@ impl DropdownMenu {
         let menu = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("Ebb"));
         menu.setAutoenablesItems(false);
         menu.setMinimumWidth(MENU_WIDTH_PT);
+        menu.setDelegate(Some(ProtocolObject::from_ref(&*target)));
 
         // Header row: `Ebb` (left) + `Updated ...` (flush-right)
         let header_row = make_header_row(mtm);
         menu.addItem(&header_row._item);
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 
-        // Provider rows (Claude -> Codex) with aligned `Reset in` sub-rows
-        let claude_row = make_provider_row(mtm, "Claude");
-        let claude_reset_row = make_reset_row(mtm);
-        let codex_row = make_provider_row(mtm, "Codex");
-        let codex_reset_row = make_reset_row(mtm);
-
-        menu.addItem(&claude_row.item);
-        menu.addItem(&claude_reset_row.item);
-        menu.addItem(&codex_row.item);
-        menu.addItem(&codex_reset_row.item);
+        // 3 reused provider slots dynamically updated in `config.provider_order`.
+        let mut provider_slots = Vec::with_capacity(Provider::ALL.len());
+        for provider in Provider::ALL {
+            let row = make_provider_row(mtm, provider.display_name());
+            let reset = make_reset_row(mtm);
+            menu.addItem(&row.item);
+            menu.addItem(&reset.item);
+            provider_slots.push(ProviderSlot { row, reset });
+        }
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 
@@ -313,11 +413,12 @@ impl DropdownMenu {
         settings_menu.addItem(&interval_parent);
         settings_menu.addItem(&NSMenuItem::separatorItem(mtm));
 
-        // Display toggles
+        // Provider visibility & reset toggles
         let show_claude_item =
             make_action_item(mtm, "Show Claude", "", &target, sel!(onToggleClaude:));
         let show_codex_item =
             make_action_item(mtm, "Show Codex", "", &target, sel!(onToggleCodex:));
+        let show_agy_item = make_action_item(mtm, "Show Agy", "", &target, sel!(onToggleAgy:));
         let show_reset_time_item = make_action_item(
             mtm,
             "Show Reset Times",
@@ -327,10 +428,114 @@ impl DropdownMenu {
         );
         settings_menu.addItem(&show_claude_item);
         settings_menu.addItem(&show_codex_item);
+        settings_menu.addItem(&show_agy_item);
         settings_menu.addItem(&show_reset_time_item);
+
+        // Display submenu (Modes, Critical Highlight, Provider Order, Color Theme)
+        let display_parent = make_static_item(mtm, "Display");
+        display_parent.setEnabled(true);
+        let display_menu = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("Display"));
+        display_menu.setAutoenablesItems(false);
+
+        let metric_remaining_item =
+            make_action_item(mtm, "Remaining %", "", &target, sel!(onMetricRemaining:));
+        let metric_used_item = make_action_item(mtm, "Used %", "", &target, sel!(onMetricUsed:));
+        display_menu.addItem(&metric_remaining_item);
+        display_menu.addItem(&metric_used_item);
+        display_menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+        let windows_both_item =
+            make_action_item(mtm, "5h + Weekly", "", &target, sel!(onWindowsBoth:));
+        let windows_5h_item = make_action_item(
+            mtm,
+            "5h Only (Compact)",
+            "",
+            &target,
+            sel!(onWindowsFiveHourOnly:),
+        );
+        let highlight_critical_item = make_action_item(
+            mtm,
+            "Highlight Critical",
+            "",
+            &target,
+            sel!(onToggleHighlightCritical:),
+        );
+        display_menu.addItem(&windows_both_item);
+        display_menu.addItem(&windows_5h_item);
+        display_menu.addItem(&highlight_critical_item);
+        display_menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+        let order_parent = make_static_item(mtm, "Provider Order");
+        order_parent.setEnabled(true);
+        let order_menu = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("Provider Order"));
+        order_menu.setAutoenablesItems(false);
+        let order_first_items = vec![
+            (
+                Provider::Claude,
+                make_action_item(
+                    mtm,
+                    "Move Claude First",
+                    "",
+                    &target,
+                    sel!(onMoveClaudeFirst:),
+                ),
+            ),
+            (
+                Provider::Codex,
+                make_action_item(
+                    mtm,
+                    "Move Codex First",
+                    "",
+                    &target,
+                    sel!(onMoveCodexFirst:),
+                ),
+            ),
+            (
+                Provider::Agy,
+                make_action_item(mtm, "Move Agy First", "", &target, sel!(onMoveAgyFirst:)),
+            ),
+        ];
+        for (_, item) in &order_first_items {
+            order_menu.addItem(item);
+        }
+        order_parent.setSubmenu(Some(&order_menu));
+        display_menu.addItem(&order_parent);
+
+        let theme_parent = make_static_item(mtm, "Color Theme");
+        theme_parent.setEnabled(true);
+        let theme_menu = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("Color Theme"));
+        theme_menu.setAutoenablesItems(false);
+        let theme_items = vec![
+            (
+                ColorTheme::Default,
+                make_action_item(mtm, "Default", "", &target, sel!(onThemeDefault:)),
+            ),
+            (
+                ColorTheme::HighContrast,
+                make_action_item(
+                    mtm,
+                    "High Contrast",
+                    "",
+                    &target,
+                    sel!(onThemeHighContrast:),
+                ),
+            ),
+            (
+                ColorTheme::Monochrome,
+                make_action_item(mtm, "Monochrome", "", &target, sel!(onThemeMonochrome:)),
+            ),
+        ];
+        for (_, item) in &theme_items {
+            theme_menu.addItem(item);
+        }
+        theme_parent.setSubmenu(Some(&theme_menu));
+        display_menu.addItem(&theme_parent);
+
+        display_parent.setSubmenu(Some(&display_menu));
+        settings_menu.addItem(&display_parent);
         settings_menu.addItem(&NSMenuItem::separatorItem(mtm));
 
-        // Low Quota Alerts submenu (BL-002)
+        // Low Quota Alerts submenu
         let alerts_parent = make_static_item(mtm, "Low Quota Alerts");
         alerts_parent.setEnabled(true);
         let alerts_menu =
@@ -394,6 +599,32 @@ impl DropdownMenu {
 
         alerts_parent.setSubmenu(Some(&alerts_menu));
         settings_menu.addItem(&alerts_parent);
+
+        // Integrations submenu (one-click opt-in setup with preview dialog)
+        let integrations_parent = make_static_item(mtm, "Integrations");
+        integrations_parent.setEnabled(true);
+        let integrations_menu =
+            NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("Integrations"));
+        integrations_menu.setAutoenablesItems(false);
+
+        let setup_claude_item = make_action_item(
+            mtm,
+            "Setup Claude Status-Line…",
+            "",
+            &target,
+            sel!(onSetupClaudeStatusline:),
+        );
+        let setup_agy_item = make_action_item(
+            mtm,
+            "Setup Antigravity Status-Line…",
+            "",
+            &target,
+            sel!(onSetupAgyStatusline:),
+        );
+        integrations_menu.addItem(&setup_claude_item);
+        integrations_menu.addItem(&setup_agy_item);
+        integrations_parent.setSubmenu(Some(&integrations_menu));
+        settings_menu.addItem(&integrations_parent);
         settings_menu.addItem(&NSMenuItem::separatorItem(mtm));
 
         let launch_at_login_item = make_action_item(
@@ -433,21 +664,28 @@ impl DropdownMenu {
 
         Self {
             menu,
-            _target: target,
+            target,
             header_row,
-            claude_row,
-            claude_reset_row,
-            codex_row,
-            codex_reset_row,
+            provider_slots,
             refresh_item,
             interval_items,
             show_claude_item,
             show_codex_item,
+            show_agy_item,
             show_reset_time_item,
+            metric_remaining_item,
+            metric_used_item,
+            windows_both_item,
+            windows_5h_item,
+            highlight_critical_item,
+            order_first_items,
+            theme_items,
             alerts_enabled_item,
             notify_on_refresh_item,
             warning_threshold_items,
             critical_threshold_items,
+            setup_claude_item,
+            setup_agy_item,
             launch_at_login_item,
             last_snapshot: None,
         }
@@ -455,6 +693,11 @@ impl DropdownMenu {
 
     pub fn ns_menu(&self) -> &NSMenu {
         &self.menu
+    }
+
+    /// Manually invoke the `NSMenuDelegate::menuWillOpen:` hook via ObjC protocol dispatch (used by `--ui-smoke-test`).
+    pub fn trigger_will_open_for_test(&self) {
+        NSMenuDelegate::menuWillOpen(&*self.target, &self.menu);
     }
 
     /// Update reused `NSMenuItem`s and custom `NSView`s in-place strictly when `UiSnapshot` changed.
@@ -469,12 +712,9 @@ impl DropdownMenu {
             .right_label
             .setStringValue(&NSString::from_str(status_text));
 
-        update_provider_row(
-            &self.claude_row,
-            &self.claude_reset_row,
-            &snapshot.claude_row,
-        );
-        update_provider_row(&self.codex_row, &self.codex_reset_row, &snapshot.codex_row);
+        for (slot, row_vm) in self.provider_slots.iter().zip(&snapshot.provider_rows) {
+            update_provider_row(&slot.row, &slot.reset, row_vm, snapshot);
+        }
 
         if snapshot.is_refreshing {
             self.refresh_item
@@ -493,8 +733,33 @@ impl DropdownMenu {
             .setState(control_state(snapshot.show_claude));
         self.show_codex_item
             .setState(control_state(snapshot.show_codex));
+        self.show_agy_item
+            .setState(control_state(snapshot.show_agy));
         self.show_reset_time_item
             .setState(control_state(snapshot.show_reset_time));
+
+        self.metric_remaining_item.setState(control_state(
+            snapshot.display_metric == DisplayMetric::Remaining,
+        ));
+        self.metric_used_item.setState(control_state(
+            snapshot.display_metric == DisplayMetric::Used,
+        ));
+        self.windows_both_item.setState(control_state(
+            snapshot.menu_bar_windows == MenuBarWindows::Both,
+        ));
+        self.windows_5h_item.setState(control_state(
+            snapshot.menu_bar_windows == MenuBarWindows::FiveHourOnly,
+        ));
+        self.highlight_critical_item
+            .setState(control_state(snapshot.highlight_critical));
+
+        let first_provider = snapshot.provider_order.first().copied();
+        for &(provider, ref item) in &self.order_first_items {
+            item.setState(control_state(Some(provider) == first_provider));
+        }
+        for &(theme, ref item) in &self.theme_items {
+            item.setState(control_state(theme == snapshot.color_theme));
+        }
 
         self.alerts_enabled_item
             .setState(control_state(snapshot.alerts_enabled));
@@ -511,6 +776,11 @@ impl DropdownMenu {
             item.setEnabled(snapshot.alerts_enabled && pct < snapshot.alert_warning_threshold);
         }
 
+        self.setup_claude_item
+            .setState(control_state(snapshot.claude_configured));
+        self.setup_agy_item
+            .setState(control_state(snapshot.agy_configured));
+
         self.launch_at_login_item
             .setState(control_state(snapshot.launch_at_login));
 
@@ -520,43 +790,46 @@ impl DropdownMenu {
 
     pub fn debug_inspect(&self) -> MenuDebugInfo {
         let header_right_text = self.header_row.right_label.stringValue().to_string();
-        let claude_row_text = format!(
-            "● {}\t{}",
-            self.claude_row.name_label.stringValue(),
-            self.claude_row.value_label.stringValue()
-        );
-        let claude_reset_text = if self.claude_reset_row.item.isHidden() {
-            None
-        } else {
-            Some(format!(
-                "{}\t{}",
-                self.claude_reset_row.left_label.stringValue(),
-                self.claude_reset_row.value_label.stringValue()
-            ))
-        };
-        let codex_row_text = format!(
-            "● {}\t{}",
-            self.codex_row.name_label.stringValue(),
-            self.codex_row.value_label.stringValue()
-        );
-        let codex_reset_text = if self.codex_reset_row.item.isHidden() {
-            None
-        } else {
-            Some(format!(
-                "{}\t{}",
-                self.codex_reset_row.left_label.stringValue(),
-                self.codex_reset_row.value_label.stringValue()
-            ))
-        };
+        let mut visible_rows = Vec::new();
+        let mut claude_row_text = String::new();
+        let mut claude_reset_text = None;
+        let mut codex_row_text = String::new();
+        let mut codex_reset_text = None;
 
-        let p_name_frame = self.claude_row.name_label.frame();
-        let r_left_frame = self.claude_reset_row.left_label.frame();
-        let p_val_frame = self.claude_row.value_label.frame();
-        let r_val_frame = self.claude_reset_row.value_label.frame();
+        for slot in &self.provider_slots {
+            let name = slot.row.name_label.stringValue().to_string();
+            let row_text = format!("● {name}\t{}", slot.row.value_label.stringValue());
+            let reset_text = if slot.reset.item.isHidden() {
+                None
+            } else {
+                Some(format!(
+                    "{}\t{}",
+                    slot.reset.left_label.stringValue(),
+                    slot.reset.value_label.stringValue()
+                ))
+            };
+            if !slot.row.item.isHidden() {
+                visible_rows.push((row_text.clone(), reset_text.clone()));
+            }
+            if name == "Claude" {
+                claude_row_text = row_text;
+                claude_reset_text = reset_text;
+            } else if name == "Codex" {
+                codex_row_text = row_text;
+                codex_reset_text = reset_text;
+            }
+        }
+
+        let first_slot = &self.provider_slots[0];
+        let p_name_frame = first_slot.row.name_label.frame();
+        let r_left_frame = first_slot.reset.left_label.frame();
+        let p_val_frame = first_slot.row.value_label.frame();
+        let r_val_frame = first_slot.reset.value_label.frame();
 
         MenuDebugInfo {
             top_level_items: self.menu.numberOfItems(),
             header_right_text,
+            visible_rows,
             claude_row_text,
             claude_reset_text,
             codex_row_text,
@@ -748,8 +1021,18 @@ fn update_provider_row(
     handles: &ProviderRowHandles,
     reset_handles: &ResetRowHandles,
     row: &ProviderRowViewModel,
+    snapshot: &UiSnapshot,
 ) {
-    let dot_color = provider_dynamic_color(row.provider, row.stale);
+    handles
+        .name_label
+        .setStringValue(&NSString::from_str(row.provider.display_name()));
+
+    let dot_color = provider_dynamic_color(
+        row.provider,
+        snapshot.color_theme,
+        &snapshot.provider_colors,
+        row.stale,
+    );
     handles.dot_label.setTextColor(Some(&dot_color));
 
     let value_color = if row.stale {
@@ -817,9 +1100,7 @@ fn make_action_item(
         )
     };
     let target_obj: &AnyObject = target;
-    unsafe {
-        item.setTarget(Some(target_obj));
-    }
+    unsafe { item.setTarget(Some(target_obj)) };
     item.setEnabled(true);
     item
 }

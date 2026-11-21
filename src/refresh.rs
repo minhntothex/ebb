@@ -3,9 +3,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, AppPaths};
 use crate::error::Result;
 use crate::model::{Provider, ProviderState, QuotaSnapshot, UsageCache};
+use crate::providers::agy::AgyAdapter;
 use crate::providers::claude::ClaudeAdapter;
 use crate::providers::codex::CodexAdapter;
 use crate::ui::view_model::UiSnapshot;
@@ -17,15 +18,16 @@ pub enum RefreshReason {
     Periodic,
     Manual,
     Wake,
-    /// Dedicated fast-path triggered by `ClaudeCacheWatcher` when `claude-statusline-cache.json` changes.
-    /// Reads only the local Claude cache without spawning `codex app-server`.
-    ClaudeCacheChanged,
+    /// Dedicated fast-path triggered by `AppDirWatcher` when local status-line cache files
+    /// (`claude-statusline-cache.json` or `agy-statusline-cache.json`) change on disk.
+    /// Reads only local cache files without spawning `codex app-server`.
+    LocalCacheChanged,
 }
 
 impl RefreshReason {
-    /// Whether this refresh cycle should also poll Codex (`false` for Claude-only cache watch fast-path).
+    /// Whether this refresh cycle should also poll Codex (`false` for local cache watch fast-path).
     pub const fn fetches_codex(self) -> bool {
-        !matches!(self, RefreshReason::ClaudeCacheChanged)
+        !matches!(self, RefreshReason::LocalCacheChanged)
     }
 }
 
@@ -35,17 +37,21 @@ pub struct RefreshConfig {
     pub interval: Duration,
     pub show_claude: bool,
     pub show_codex: bool,
+    pub show_agy: bool,
     pub claude_cache_path: PathBuf,
+    pub agy_cache_path: PathBuf,
     pub codex_path: Option<String>,
 }
 
 impl RefreshConfig {
-    pub fn from_app_config(config: &AppConfig, claude_cache_path: PathBuf) -> Self {
+    pub fn from_app_config(config: &AppConfig, paths: &AppPaths) -> Self {
         Self {
             interval: Duration::from_secs(config.refresh_interval_seconds),
             show_claude: config.show_claude,
             show_codex: config.show_codex,
-            claude_cache_path,
+            show_agy: config.show_agy,
+            claude_cache_path: paths.claude_cache_path.clone(),
+            agy_cache_path: paths.agy_cache_path.clone(),
             codex_path: config.codex_path.clone(),
         }
     }
@@ -57,6 +63,7 @@ pub struct RefreshOutcome {
     pub reason: RefreshReason,
     pub claude: Option<Result<Option<QuotaSnapshot>>>,
     pub codex: Option<Result<QuotaSnapshot>>,
+    pub agy: Option<Result<Option<QuotaSnapshot>>>,
     pub completed_at: u64,
 }
 
@@ -64,7 +71,7 @@ pub struct RefreshOutcome {
 #[derive(Debug)]
 pub enum RefreshEvent {
     Started(RefreshReason),
-    Completed(RefreshOutcome),
+    Completed(Box<RefreshOutcome>),
 }
 
 /// Platform-independent application state owned by the UI/main thread.
@@ -73,25 +80,31 @@ pub struct AppState {
     pub config: AppConfig,
     pub claude: ProviderState,
     pub codex: ProviderState,
+    pub agy: ProviderState,
     pub is_refreshing: bool,
 }
 
 impl AppState {
-    /// Initialize state from persisted `usage-cache.json` and optional dedicated Claude cache.
+    /// Initialize state from persisted `usage-cache.json` and optional dedicated Claude/Agy caches.
     pub fn from_persisted(
         config: AppConfig,
         persisted_cache: UsageCache,
         claude_statusline_snapshot: Option<QuotaSnapshot>,
+        agy_statusline_snapshot: Option<QuotaSnapshot>,
         now_secs: u64,
     ) -> Self {
         let mut claude = ProviderState::new(Provider::Claude);
         let mut codex = ProviderState::new(Provider::Codex);
+        let mut agy = ProviderState::new(Provider::Agy);
 
         if let Some(s) = persisted_cache.claude {
             claude.seed_from_cache(s);
         }
         if let Some(s) = persisted_cache.codex {
             codex.seed_from_cache(s);
+        }
+        if let Some(s) = persisted_cache.agy {
+            agy.seed_from_cache(s);
         }
 
         if let Some(live_claude) = claude_statusline_snapshot {
@@ -103,11 +116,21 @@ impl AppState {
                 claude.apply_success(live_claude, now_secs);
             }
         }
+        if let Some(live_agy) = agy_statusline_snapshot {
+            let is_newer = agy
+                .snapshot
+                .as_ref()
+                .is_none_or(|prev| live_agy.fetched_at >= prev.fetched_at);
+            if is_newer {
+                agy.apply_success(live_agy, now_secs);
+            }
+        }
 
         Self {
             config,
             claude,
             codex,
+            agy,
             is_refreshing: false,
         }
     }
@@ -117,29 +140,14 @@ impl AppState {
     }
 
     /// Merge a completed background refresh cycle into state.
-    /// Returns `true` if either provider's persisted snapshot changed (and should be saved to disk).
+    /// Returns `true` if any provider's persisted snapshot changed (and should be saved to disk).
     pub fn apply_refresh_outcome(&mut self, outcome: RefreshOutcome) -> bool {
         let prev_claude = self.claude.snapshot.clone();
         let prev_codex = self.codex.snapshot.clone();
+        let prev_agy = self.agy.snapshot.clone();
 
         if let Some(res) = outcome.claude {
-            match res {
-                Ok(Some(snap)) => {
-                    let is_newer = self
-                        .claude
-                        .snapshot
-                        .as_ref()
-                        .is_none_or(|prev| snap.fetched_at >= prev.fetched_at);
-                    if is_newer {
-                        self.claude.apply_success(snap, outcome.completed_at);
-                    }
-                }
-                Ok(None) => {
-                    // Passive source has no cache file yet; preserve existing state cleanly.
-                    self.claude.last_attempt_at = Some(outcome.completed_at);
-                }
-                Err(err) => self.claude.apply_failure(&err, outcome.completed_at),
-            }
+            merge_passive_outcome(&mut self.claude, res, outcome.completed_at);
         }
 
         if let Some(res) = outcome.codex {
@@ -149,8 +157,14 @@ impl AppState {
             }
         }
 
+        if let Some(res) = outcome.agy {
+            merge_passive_outcome(&mut self.agy, res, outcome.completed_at);
+        }
+
         self.is_refreshing = false;
-        self.claude.snapshot != prev_claude || self.codex.snapshot != prev_codex
+        self.claude.snapshot != prev_claude
+            || self.codex.snapshot != prev_codex
+            || self.agy.snapshot != prev_agy
     }
 
     pub fn ui_snapshot(&self, now_secs: u64) -> UiSnapshot {
@@ -158,6 +172,7 @@ impl AppState {
             &self.config,
             &self.claude,
             &self.codex,
+            &self.agy,
             self.is_refreshing,
             now_secs,
         )
@@ -171,6 +186,9 @@ impl AppState {
         if let Some(ref s) = self.codex.snapshot {
             cache.set_snapshot(s.clone());
         }
+        if let Some(ref s) = self.agy.snapshot {
+            cache.set_snapshot(s.clone());
+        }
         cache
     }
 }
@@ -179,9 +197,10 @@ impl AppState {
 pub trait QuotaFetcher: Send + 'static {
     fn fetch_claude(&self, cfg: &RefreshConfig) -> Result<Option<QuotaSnapshot>>;
     fn fetch_codex(&self, cfg: &RefreshConfig) -> Result<QuotaSnapshot>;
+    fn fetch_agy(&self, cfg: &RefreshConfig) -> Result<Option<QuotaSnapshot>>;
 }
 
-/// Production fetcher delegating to `ClaudeAdapter` (cache read) and `CodexAdapter` (short-lived RPC).
+/// Production fetcher delegating to `ClaudeAdapter`, `AgyAdapter`, and `CodexAdapter`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LiveQuotaFetcher;
 
@@ -192,6 +211,32 @@ impl QuotaFetcher for LiveQuotaFetcher {
 
     fn fetch_codex(&self, cfg: &RefreshConfig) -> Result<QuotaSnapshot> {
         CodexAdapter::new(cfg.codex_path.clone()).fetch_snapshot()
+    }
+
+    fn fetch_agy(&self, cfg: &RefreshConfig) -> Result<Option<QuotaSnapshot>> {
+        AgyAdapter::new(cfg.agy_cache_path.clone()).read_snapshot()
+    }
+}
+
+fn merge_passive_outcome(
+    state: &mut ProviderState,
+    res: Result<Option<QuotaSnapshot>>,
+    completed_at: u64,
+) {
+    match res {
+        Ok(Some(snap)) => {
+            let is_newer = state
+                .snapshot
+                .as_ref()
+                .is_none_or(|prev| snap.fetched_at >= prev.fetched_at);
+            if is_newer {
+                state.apply_success(snap, completed_at);
+            }
+        }
+        Ok(None) => {
+            state.last_attempt_at = Some(completed_at);
+        }
+        Err(err) => state.apply_failure(&err, completed_at),
     }
 }
 
@@ -324,7 +369,7 @@ fn merge_reason(existing: Option<RefreshReason>, incoming: RefreshReason) -> Ref
 
 fn reason_priority(reason: RefreshReason) -> u8 {
     match reason {
-        RefreshReason::ClaudeCacheChanged => 0,
+        RefreshReason::LocalCacheChanged => 0,
         RefreshReason::Periodic => 1,
         RefreshReason::Startup => 2,
         RefreshReason::Wake => 3,
@@ -400,11 +445,17 @@ where
         } else {
             None
         };
+        let agy = if cfg.show_agy {
+            Some(fetcher.fetch_agy(&cfg))
+        } else {
+            None
+        };
 
         let outcome = RefreshOutcome {
             reason,
             claude,
             codex,
+            agy,
             completed_at: unix_now_secs(),
         };
 
@@ -421,7 +472,7 @@ where
         };
 
         if should_emit {
-            on_event(RefreshEvent::Completed(outcome));
+            on_event(RefreshEvent::Completed(Box::new(outcome)));
         }
     }
 }

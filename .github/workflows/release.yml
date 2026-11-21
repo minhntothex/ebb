@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to package and publish (e.g. 26.2)"
+        description: "Release tag to package and publish (e.g. 26.3)"
         required: true
         type: string
 
@@ -121,9 +121,10 @@ jobs:
              xattr -dr com.apple.quarantine /Applications/Ebb.app
              open /Applications/Ebb.app
              \`\`\`
-          3. *(Optional)* Enable Claude Code status-line integration (backs up and chains any existing config):
+          3. *(Optional)* Enable Claude Code or Antigravity CLI (\`agy\`) status-line integration (backs up and chains any existing config):
              \`\`\`bash
              /Applications/Ebb.app/Contents/MacOS/ebb setup-claude-statusline --apply
+             /Applications/Ebb.app/Contents/MacOS/ebb setup-agy-statusline --apply
              \`\`\`
 
           A release-ready Homebrew Cask (\`ebb.rb\`) pre-populated with the verified DMG \`SHA256\` is also attached.

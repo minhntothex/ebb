@@ -1,8 +1,8 @@
 [package]
 name = "ebb"
-version = "26.2.0"
+version = "26.3.0"
 edition = "2024"
-description = "Minimal macOS Menu Bar monitor for Claude Code and OpenAI Codex remaining quota"
+description = "Minimal macOS Menu Bar monitor for Claude Code, OpenAI Codex, and Antigravity CLI quota"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

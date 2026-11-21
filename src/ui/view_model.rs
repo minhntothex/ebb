@@ -1,7 +1,9 @@
-use crate::config::AppConfig;
+use std::collections::BTreeMap;
+
+use crate::config::{AppConfig, ColorTheme, HexColorOverride, parse_hex_rgb};
 use crate::model::{
-    MISSING_VALUE, MenuBarSegment, Provider, ProviderHealth, ProviderState, QuotaSnapshot,
-    build_menu_bar_segments, format_dropdown_snapshot,
+    DisplayMetric, MISSING_VALUE, MenuBarSegment, MenuBarWindows, Provider, ProviderHealth,
+    ProviderState, QuotaSnapshot, build_menu_bar_segments_ordered, format_dropdown_snapshot_with,
 };
 
 /// Supported refresh interval presets exposed in the native Settings submenu.
@@ -35,18 +37,71 @@ pub struct ProviderColorPair {
     pub light: RgbColor,
 }
 
-/// Canonical color pair for each provider (Dark matches MVP spec; Light meets WCAG readability).
+/// Dynamic accessible red used for per-window critical quota emphasis in the Menu Bar.
+pub const CRITICAL_COLORS: ProviderColorPair = ProviderColorPair {
+    dark: RgbColor::new(0xFF, 0x6B, 0x6B),
+    light: RgbColor::new(0xC9, 0x2A, 0x2A),
+};
+
+/// Canonical default color pair for each provider (Dark matches MVP spec; Light meets WCAG readability).
 pub const fn provider_colors(provider: Provider) -> ProviderColorPair {
-    match provider {
-        Provider::Claude => ProviderColorPair {
-            dark: RgbColor::new(0xE8, 0x9A, 0x70),
-            light: RgbColor::new(0xB8, 0x4E, 0x1E),
+    provider_colors_for_theme(provider, ColorTheme::Default)
+}
+
+/// Curated palette per provider and `ColorTheme`.
+pub const fn provider_colors_for_theme(provider: Provider, theme: ColorTheme) -> ProviderColorPair {
+    match theme {
+        ColorTheme::Default => match provider {
+            Provider::Claude => ProviderColorPair {
+                dark: RgbColor::new(0xE8, 0x9A, 0x70),
+                light: RgbColor::new(0xB8, 0x4E, 0x1E),
+            },
+            Provider::Codex => ProviderColorPair {
+                dark: RgbColor::new(0x74, 0xC8, 0x9A),
+                light: RgbColor::new(0x18, 0x79, 0x4E),
+            },
+            Provider::Agy => ProviderColorPair {
+                dark: RgbColor::new(0x7E, 0xB6, 0xFF),
+                light: RgbColor::new(0x1D, 0x5F, 0xD6),
+            },
         },
-        Provider::Codex => ProviderColorPair {
-            dark: RgbColor::new(0x74, 0xC8, 0x9A),
-            light: RgbColor::new(0x18, 0x79, 0x4E),
+        ColorTheme::HighContrast => match provider {
+            Provider::Claude => ProviderColorPair {
+                dark: RgbColor::new(0xFF, 0xB3, 0x8A),
+                light: RgbColor::new(0x9E, 0x38, 0x08),
+            },
+            Provider::Codex => ProviderColorPair {
+                dark: RgbColor::new(0x8C, 0xE8, 0xB5),
+                light: RgbColor::new(0x0D, 0x64, 0x3D),
+            },
+            Provider::Agy => ProviderColorPair {
+                dark: RgbColor::new(0x99, 0xC8, 0xFF),
+                light: RgbColor::new(0x0E, 0x47, 0xB5),
+            },
+        },
+        ColorTheme::Monochrome => ProviderColorPair {
+            dark: RgbColor::new(0xE8, 0xE8, 0xED),
+            light: RgbColor::new(0x22, 0x22, 0x26),
         },
     }
+}
+
+/// Resolve the effective Dark/Light color pair applying any valid `#RRGGBB` override from `config.json`.
+pub fn resolve_provider_colors(
+    provider: Provider,
+    theme: ColorTheme,
+    overrides: &BTreeMap<String, HexColorOverride>,
+) -> ProviderColorPair {
+    let mut pair = provider_colors_for_theme(provider, theme);
+    if let Some(custom) = overrides.get(provider.key()) {
+        if let Some((r, g, b)) = custom.dark.as_deref().and_then(parse_hex_rgb) {
+            pair.dark = RgbColor::new(r, g, b);
+        }
+        if let Some((r, g, b)) = custom.light.as_deref().and_then(parse_hex_rgb) {
+            pair.light = RgbColor::new(r, g, b);
+        }
+    }
+    pair
 }
 
 /// View model for one provider row inside the native `NSMenu` dropdown.
@@ -66,23 +121,32 @@ pub struct ProviderRowViewModel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UiSnapshot {
     pub menu_bar_segments: Vec<MenuBarSegment>,
-    /// True when both providers are hidden in Settings; renders compact `–` so Menu Bar stays clickable.
+    /// True when all providers are hidden in Settings; renders compact `–` so Menu Bar stays clickable.
     pub menu_bar_fallback_only: bool,
     pub menu_bar_tooltip: String,
-    pub claude_row: ProviderRowViewModel,
-    pub codex_row: ProviderRowViewModel,
-    /// Optional subtle footer line (e.g. `Refreshing…` or `Updated 2m ago · Claude stale`).
+    /// Provider rows ordered by `config.normalized_provider_order()`.
+    pub provider_rows: Vec<ProviderRowViewModel>,
+    /// Optional subtle header status line (e.g. `Refreshing…` or `Updated 2m ago · Claude stale`).
     pub status_line: Option<String>,
     pub is_refreshing: bool,
     pub refresh_interval_seconds: u64,
     pub show_claude: bool,
     pub show_codex: bool,
+    pub show_agy: bool,
     pub show_reset_time: bool,
+    pub display_metric: DisplayMetric,
+    pub menu_bar_windows: MenuBarWindows,
+    pub highlight_critical: bool,
+    pub provider_order: Vec<Provider>,
+    pub color_theme: ColorTheme,
+    pub provider_colors: BTreeMap<String, HexColorOverride>,
     pub alerts_enabled: bool,
     pub notify_on_refresh: bool,
     pub alert_warning_threshold: u8,
     pub alert_critical_threshold: u8,
     pub launch_at_login: bool,
+    pub claude_configured: bool,
+    pub agy_configured: bool,
 }
 
 impl UiSnapshot {
@@ -90,67 +154,101 @@ impl UiSnapshot {
         config: &AppConfig,
         claude: &ProviderState,
         codex: &ProviderState,
+        agy: &ProviderState,
         is_refreshing: bool,
         now_secs: u64,
     ) -> Self {
+        let order = config.normalized_provider_order();
+        let state_for = |provider: Provider| match provider {
+            Provider::Claude => claude,
+            Provider::Codex => codex,
+            Provider::Agy => agy,
+        };
+
         let claude_health = claude.effective_health(now_secs, config.claude_stale_after_seconds);
         let codex_health = codex.effective_health(now_secs, config.codex_stale_after_seconds);
+        let agy_health = agy.effective_health(now_secs, config.agy_stale_after_seconds);
+        let health_for = |provider: Provider| match provider {
+            Provider::Claude => &claude_health,
+            Provider::Codex => &codex_health,
+            Provider::Agy => &agy_health,
+        };
 
         let claude_snap = claude.visible_snapshot(now_secs, config.snapshot_ttl_seconds);
         let codex_snap = codex.visible_snapshot(now_secs, config.snapshot_ttl_seconds);
+        let agy_snap = agy.visible_snapshot(now_secs, config.snapshot_ttl_seconds);
+        let snap_for = |provider: Provider| match provider {
+            Provider::Claude => claude_snap,
+            Provider::Codex => codex_snap,
+            Provider::Agy => agy_snap,
+        };
 
-        let claude_stale = claude_snap.is_some() && claude_health.is_stale();
-        let codex_stale = codex_snap.is_some() && codex_health.is_stale();
-
-        let menu_bar_segments = build_menu_bar_segments(
-            claude_snap.map(|s| (s, claude_stale)),
-            codex_snap.map(|s| (s, codex_stale)),
-            config.show_claude,
-            config.show_codex,
+        let critical_threshold = config
+            .highlight_critical
+            .then_some(config.alert_critical_threshold);
+        let menu_bar_segments = build_menu_bar_segments_ordered(
+            &order,
+            |provider| {
+                if !config.is_provider_visible(provider) {
+                    return None;
+                }
+                let snap = snap_for(provider);
+                let stale = snap.is_some() && health_for(provider).is_stale();
+                Some((snap, stale))
+            },
+            config.display_metric,
+            config.menu_bar_windows,
+            critical_threshold,
         );
         let menu_bar_fallback_only = menu_bar_segments.is_empty();
 
-        let claude_reset_value = if config.show_reset_time {
-            format_reset_values(claude_snap, now_secs)
-        } else {
-            None
-        };
-        let codex_reset_value = if config.show_reset_time {
-            format_reset_values(codex_snap, now_secs)
-        } else {
-            None
-        };
-
-        let claude_row = ProviderRowViewModel {
-            provider: Provider::Claude,
-            value_text: format_dropdown_snapshot(claude_snap),
-            reset_value_text: claude_reset_value,
-            stale: claude_stale,
-            visible: config.show_claude,
-            tooltip: build_provider_tooltip(claude, &claude_health, claude_snap, now_secs),
-        };
-        let codex_row = ProviderRowViewModel {
-            provider: Provider::Codex,
-            value_text: format_dropdown_snapshot(codex_snap),
-            reset_value_text: codex_reset_value,
-            stale: codex_stale,
-            visible: config.show_codex,
-            tooltip: build_provider_tooltip(codex, &codex_health, codex_snap, now_secs),
-        };
-
-        let menu_bar_tooltip = format!(
-            "Ebb (5h / weekly remaining)\nClaude: {}\nCodex: {}",
-            claude_row.value_text, codex_row.value_text
-        );
+        let mut provider_rows = Vec::with_capacity(order.len());
+        let mut tooltip_lines = vec![format!(
+            "Ebb (5h / weekly {})",
+            config.display_metric.label()
+        )];
+        for &provider in &order {
+            let state = state_for(provider);
+            let health = health_for(provider);
+            let snap = snap_for(provider);
+            let stale = snap.is_some() && health.is_stale();
+            let visible = config.is_provider_visible(provider);
+            let value_text = format_dropdown_snapshot_with(snap, config.display_metric);
+            let reset_value_text = if config.show_reset_time {
+                format_reset_values(snap, now_secs)
+            } else {
+                None
+            };
+            if visible {
+                tooltip_lines.push(format!("{provider}: {value_text}"));
+            }
+            provider_rows.push(ProviderRowViewModel {
+                provider,
+                value_text,
+                reset_value_text,
+                stale,
+                visible,
+                tooltip: build_provider_tooltip(
+                    state,
+                    health,
+                    snap,
+                    config.display_metric,
+                    now_secs,
+                ),
+            });
+        }
+        let menu_bar_tooltip = tooltip_lines.join("\n");
 
         let status_line = build_status_line(
             is_refreshing,
-            &claude_health,
-            &codex_health,
-            claude.last_success_at,
-            codex.last_success_at,
-            config.show_claude,
-            config.show_codex,
+            &order,
+            |p| {
+                (
+                    config.is_provider_visible(p),
+                    health_for(p),
+                    state_for(p).last_success_at,
+                )
+            },
             now_secs,
         );
 
@@ -158,20 +256,43 @@ impl UiSnapshot {
             menu_bar_segments,
             menu_bar_fallback_only,
             menu_bar_tooltip,
-            claude_row,
-            codex_row,
+            provider_rows,
             status_line,
             is_refreshing,
             refresh_interval_seconds: config.refresh_interval_seconds,
             show_claude: config.show_claude,
             show_codex: config.show_codex,
+            show_agy: config.show_agy,
             show_reset_time: config.show_reset_time,
+            display_metric: config.display_metric,
+            menu_bar_windows: config.menu_bar_windows,
+            highlight_critical: config.highlight_critical,
+            provider_order: order,
+            color_theme: config.color_theme,
+            provider_colors: config.provider_colors.clone(),
             alerts_enabled: config.alerts_enabled,
             notify_on_refresh: config.notify_on_refresh,
             alert_warning_threshold: config.alert_warning_threshold,
             alert_critical_threshold: config.alert_critical_threshold,
             launch_at_login: config.launch_at_login,
+            claude_configured: false,
+            agy_configured: false,
         }
+    }
+
+    /// Attach current status-line integration states for `Settings → Integrations` checkmarks.
+    pub fn with_integrations(mut self, claude_configured: bool, agy_configured: bool) -> Self {
+        self.claude_configured = claude_configured;
+        self.agy_configured = agy_configured;
+        self
+    }
+
+    /// Look up the row view model for a specific provider regardless of ordering.
+    pub fn row_for(&self, provider: Provider) -> &ProviderRowViewModel {
+        self.provider_rows
+            .iter()
+            .find(|r| r.provider == provider)
+            .expect("UiSnapshot always contains all providers")
     }
 
     /// Plain text summary of Menu Bar content for tests and accessibility.
@@ -181,7 +302,7 @@ impl UiSnapshot {
         }
         self.menu_bar_segments
             .iter()
-            .map(|s| s.text.as_str())
+            .map(MenuBarSegment::plain_text)
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -191,6 +312,7 @@ fn build_provider_tooltip(
     state: &ProviderState,
     effective_health: &ProviderHealth,
     visible_snapshot: Option<&QuotaSnapshot>,
+    metric: DisplayMetric,
     now_secs: u64,
 ) -> String {
     let provider = state.provider;
@@ -198,6 +320,7 @@ fn build_provider_tooltip(
     let source_hint = match provider {
         Provider::Claude => "status-line cache (updates during active Claude Code sessions)",
         Provider::Codex => "Codex app-server poll",
+        Provider::Agy => "status-line cache (updates during active Antigravity CLI sessions)",
     };
 
     let status_desc = match effective_health {
@@ -223,6 +346,8 @@ fn build_provider_tooltip(
         ProviderHealth::Unavailable => {
             if !has_visible_snapshot && provider == Provider::Claude {
                 "Waiting for Claude Code status-line data".to_owned()
+            } else if !has_visible_snapshot && provider == Provider::Agy {
+                "Waiting for Antigravity CLI status-line data".to_owned()
             } else if let Some(ref err) = state.last_error {
                 format!("Unavailable ({err})")
             } else {
@@ -232,7 +357,10 @@ fn build_provider_tooltip(
         ProviderHealth::Error(msg) => format!("Error: {msg}"),
     };
 
-    let mut out = format!("{provider}: {status_desc}\n5h / weekly remaining · {source_hint}");
+    let mut out = format!(
+        "{provider}: {status_desc}\n5h / weekly {} · {source_hint}",
+        metric.label()
+    );
     if let Some(reset_desc) = format_reset_tooltip(visible_snapshot, now_secs) {
         out.push('\n');
         out.push_str(&reset_desc);
@@ -240,15 +368,10 @@ fn build_provider_tooltip(
     out
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_status_line(
+fn build_status_line<'a>(
     is_refreshing: bool,
-    claude_health: &ProviderHealth,
-    codex_health: &ProviderHealth,
-    claude_ts: Option<u64>,
-    codex_ts: Option<u64>,
-    show_claude: bool,
-    show_codex: bool,
+    order: &[Provider],
+    info_for: impl Fn(Provider) -> (bool, &'a ProviderHealth, Option<u64>),
     now_secs: u64,
 ) -> Option<String> {
     if is_refreshing {
@@ -258,19 +381,15 @@ fn build_status_line(
     let mut notes = Vec::new();
     let mut latest_ts: Option<u64> = None;
 
-    if show_claude {
-        if let Some(ts) = claude_ts {
+    for &provider in order {
+        let (visible, health, ts_opt) = info_for(provider);
+        if !visible {
+            continue;
+        }
+        if let Some(ts) = ts_opt {
             latest_ts = Some(latest_ts.map_or(ts, |prev| prev.max(ts)));
         }
-        if let Some(note) = short_health_note(Provider::Claude, claude_health) {
-            notes.push(note);
-        }
-    }
-    if show_codex {
-        if let Some(ts) = codex_ts {
-            latest_ts = Some(latest_ts.map_or(ts, |prev| prev.max(ts)));
-        }
-        if let Some(note) = short_health_note(Provider::Codex, codex_health) {
+        if let Some(note) = short_health_note(provider, health) {
             notes.push(note);
         }
     }

@@ -1,10 +1,14 @@
+use std::collections::BTreeMap;
 use std::process::Command;
 
-use ebb::config::AppConfig;
+use ebb::config::{AppConfig, ColorTheme, HexColorOverride};
 use ebb::error::AppError;
-use ebb::model::{Provider, ProviderState, QuotaSnapshot, QuotaWindow};
+use ebb::model::{
+    DisplayMetric, MenuBarWindows, Provider, ProviderState, QuotaSnapshot, QuotaWindow,
+};
 use ebb::ui::view_model::{
     RgbColor, UiSnapshot, format_interval_label, format_relative_age, provider_colors,
+    provider_colors_for_theme, resolve_provider_colors,
 };
 
 #[test]
@@ -16,6 +20,10 @@ fn provider_palette_matches_spec_dark_and_accessible_light() {
     let codex = provider_colors(Provider::Codex);
     assert_eq!(codex.dark, RgbColor::new(0x74, 0xC8, 0x9A));
     assert_eq!(codex.light, RgbColor::new(0x18, 0x79, 0x4E));
+
+    let agy = provider_colors(Provider::Agy);
+    assert_eq!(agy.dark, RgbColor::new(0x7E, 0xB6, 0xFF));
+    assert_eq!(agy.light, RgbColor::new(0x1D, 0x5F, 0xD6));
 }
 
 #[test]
@@ -53,23 +61,29 @@ fn ui_snapshot_formats_menu_bar_and_dropdown_per_mvp_spec() {
         },
         10_000,
     );
+    let agy = ProviderState::new(Provider::Agy);
 
-    let ui = UiSnapshot::build(&cfg, &claude, &codex, false, 10_005);
+    let ui = UiSnapshot::build(&cfg, &claude, &codex, &agy, false, 10_005);
     assert!(!ui.menu_bar_fallback_only);
     assert_eq!(ui.menu_bar_plain_text(), "65/72 43/31");
-    assert_eq!(ui.claude_row.value_text, "65% / 72%");
-    assert_eq!(ui.codex_row.value_text, "43% / 31%");
-    assert!(!ui.claude_row.stale);
-    assert!(!ui.codex_row.stale);
+    assert_eq!(ui.row_for(Provider::Claude).value_text, "65% / 72%");
+    assert_eq!(ui.row_for(Provider::Codex).value_text, "43% / 31%");
+    assert!(!ui.row_for(Provider::Claude).stale);
+    assert!(!ui.row_for(Provider::Codex).stale);
+    assert!(!ui.row_for(Provider::Agy).visible);
     assert_eq!(ui.status_line.as_deref(), Some("Updated just now"));
 
     // No `5h/weekly` or `remaining` labels leaked into dropdown row text.
-    assert!(!ui.claude_row.value_text.contains("5h"));
-    assert!(!ui.claude_row.value_text.contains("remaining"));
-    assert!(!ui.codex_row.value_text.contains("weekly"));
+    assert!(!ui.row_for(Provider::Claude).value_text.contains("5h"));
+    assert!(
+        !ui.row_for(Provider::Claude)
+            .value_text
+            .contains("remaining")
+    );
+    assert!(!ui.row_for(Provider::Codex).value_text.contains("weekly"));
 
     // Equality check supports update-on-change diffing.
-    let ui_same = UiSnapshot::build(&cfg, &claude, &codex, false, 10_005);
+    let ui_same = UiSnapshot::build(&cfg, &claude, &codex, &agy, false, 10_005);
     assert_eq!(ui, ui_same);
 }
 
@@ -96,31 +110,138 @@ fn ui_snapshot_handles_stale_unauth_hidden_providers_and_refreshing() {
         },
         2_000,
     );
+    let agy = ProviderState::new(Provider::Agy);
 
     // At now = 2_000 (1000s > default 900s claude_stale_after), Claude becomes stale.
-    let ui = UiSnapshot::build(&cfg, &claude, &codex, false, 2_000);
+    let ui = UiSnapshot::build(&cfg, &claude, &codex, &agy, false, 2_000);
     assert_eq!(ui.menu_bar_plain_text(), "85/– –/–");
-    assert!(ui.claude_row.stale);
-    assert_eq!(ui.claude_row.value_text, "85% / –");
-    assert_eq!(ui.codex_row.value_text, "– / –");
-    assert!(ui.codex_row.tooltip.contains("Not authenticated"));
+    assert!(ui.row_for(Provider::Claude).stale);
+    assert_eq!(ui.row_for(Provider::Claude).value_text, "85% / –");
+    assert_eq!(ui.row_for(Provider::Codex).value_text, "– / –");
+    assert!(
+        ui.row_for(Provider::Codex)
+            .tooltip
+            .contains("Not authenticated")
+    );
     assert_eq!(
         ui.status_line.as_deref(),
         Some("Updated 16m ago · Claude stale, Codex login needed")
     );
 
     // Refreshing status overrides footer cleanly.
-    let ui_refreshing = UiSnapshot::build(&cfg, &claude, &codex, true, 2_000);
+    let ui_refreshing = UiSnapshot::build(&cfg, &claude, &codex, &agy, true, 2_000);
     assert_eq!(ui_refreshing.status_line.as_deref(), Some("Refreshing…"));
 
-    // Hiding both providers activates compact fallback `–` so Menu Bar stays clickable.
+    // Hiding all providers activates compact fallback `–` so Menu Bar stays clickable.
     cfg.show_claude = false;
     cfg.show_codex = false;
-    let ui_hidden = UiSnapshot::build(&cfg, &claude, &codex, false, 2_000);
+    cfg.show_agy = false;
+    let ui_hidden = UiSnapshot::build(&cfg, &claude, &codex, &agy, false, 2_000);
     assert!(ui_hidden.menu_bar_fallback_only);
     assert_eq!(ui_hidden.menu_bar_plain_text(), "–");
-    assert!(!ui_hidden.claude_row.visible);
-    assert!(!ui_hidden.codex_row.visible);
+    assert!(!ui_hidden.row_for(Provider::Claude).visible);
+    assert!(!ui_hidden.row_for(Provider::Codex).visible);
+    assert!(!ui_hidden.row_for(Provider::Agy).visible);
+}
+
+#[test]
+fn ui_snapshot_supports_agy_custom_order_display_modes_critical_and_themes() {
+    let mut cfg = AppConfig {
+        show_agy: true,
+        display_metric: DisplayMetric::Used,
+        menu_bar_windows: MenuBarWindows::Both,
+        highlight_critical: true,
+        color_theme: ColorTheme::HighContrast,
+        ..AppConfig::default()
+    };
+    cfg.move_provider_first(Provider::Agy);
+
+    let mut claude = ProviderState::new(Provider::Claude);
+    claude.apply_success(
+        QuotaSnapshot {
+            provider: Provider::Claude,
+            five_hour: Some(QuotaWindow {
+                remaining_percent: 4,
+                resets_at: None,
+            }),
+            weekly: Some(QuotaWindow {
+                remaining_percent: 70,
+                resets_at: None,
+            }),
+            fetched_at: 10_000,
+        },
+        10_000,
+    );
+    let mut codex = ProviderState::new(Provider::Codex);
+    codex.apply_success(
+        QuotaSnapshot {
+            provider: Provider::Codex,
+            five_hour: Some(QuotaWindow {
+                remaining_percent: 50,
+                resets_at: None,
+            }),
+            weekly: Some(QuotaWindow {
+                remaining_percent: 80,
+                resets_at: None,
+            }),
+            fetched_at: 10_000,
+        },
+        10_000,
+    );
+    let mut agy = ProviderState::new(Provider::Agy);
+    agy.apply_success(
+        QuotaSnapshot {
+            provider: Provider::Agy,
+            five_hour: None,
+            weekly: Some(QuotaWindow {
+                remaining_percent: 94,
+                resets_at: None,
+            }),
+            fetched_at: 10_000,
+        },
+        10_000,
+    );
+
+    let ui = UiSnapshot::build(&cfg, &claude, &codex, &agy, false, 10_002);
+    assert_eq!(
+        ui.provider_rows
+            .iter()
+            .map(|r| r.provider)
+            .collect::<Vec<_>>(),
+        vec![Provider::Agy, Provider::Claude, Provider::Codex]
+    );
+    // Used % in order [Agy, Claude, Codex]
+    assert_eq!(ui.menu_bar_plain_text(), "–/6 96/30 50/20");
+    assert!(ui.menu_bar_segments[1].five_hour_critical);
+    assert!(!ui.menu_bar_segments[1].weekly_critical);
+    assert_eq!(ui.row_for(Provider::Agy).value_text, "– / 6%");
+    assert!(ui.menu_bar_tooltip.contains("5h / weekly used"));
+
+    // Compact 5h-only mode
+    cfg.menu_bar_windows = MenuBarWindows::FiveHourOnly;
+    cfg.display_metric = DisplayMetric::Remaining;
+    let compact = UiSnapshot::build(&cfg, &claude, &codex, &agy, false, 10_002);
+    assert_eq!(compact.menu_bar_plain_text(), "– 4 50");
+
+    // Color themes & hex overrides
+    let mono_a = provider_colors_for_theme(Provider::Claude, ColorTheme::Monochrome);
+    let mono_b = provider_colors_for_theme(Provider::Agy, ColorTheme::Monochrome);
+    assert_eq!(mono_a, mono_b);
+
+    let mut overrides = BTreeMap::new();
+    overrides.insert(
+        "agy".to_owned(),
+        HexColorOverride {
+            dark: Some("#112233".to_owned()),
+            light: None,
+        },
+    );
+    let resolved = resolve_provider_colors(Provider::Agy, ColorTheme::HighContrast, &overrides);
+    assert_eq!(resolved.dark, RgbColor::new(0x11, 0x22, 0x33));
+    assert_eq!(
+        resolved.light,
+        provider_colors_for_theme(Provider::Agy, ColorTheme::HighContrast).light
+    );
 }
 
 #[test]

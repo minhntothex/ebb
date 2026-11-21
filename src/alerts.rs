@@ -57,10 +57,7 @@ pub struct QuotaAlert {
 impl QuotaAlert {
     /// Deterministic notification identifier for macOS Notification Center deduplication.
     pub fn notification_id(&self) -> String {
-        let provider = match self.provider {
-            Provider::Claude => "claude",
-            Provider::Codex => "codex",
-        };
+        let provider = self.provider.key();
         let window = match self.window {
             WindowKind::FiveHour => "5h",
             WindowKind::Weekly => "weekly",
@@ -99,12 +96,11 @@ impl AlertTracker {
     /// Record already-low cached windows on startup so launching the app never replays old alerts.
     pub fn seed_baseline(
         &mut self,
-        claude: Option<&QuotaSnapshot>,
-        codex: Option<&QuotaSnapshot>,
+        snapshots: &[Option<&QuotaSnapshot>],
         cfg: &AppConfig,
         now_secs: u64,
     ) {
-        for snap in [claude, codex].into_iter().flatten() {
+        for snap in snapshots.iter().copied().flatten() {
             for (kind, win) in [
                 (WindowKind::FiveHour, snap.five_hour),
                 (WindowKind::Weekly, snap.weekly),
@@ -234,10 +230,7 @@ fn classify_level(remaining_percent: u8, cfg: &AppConfig) -> Option<AlertLevel> 
 }
 
 fn provider_visible(provider: Provider, cfg: &AppConfig) -> bool {
-    match provider {
-        Provider::Claude => cfg.show_claude,
-        Provider::Codex => cfg.show_codex,
-    }
+    cfg.is_provider_visible(provider)
 }
 
 /// Format crisp `(title, body)` copy for a macOS notification.

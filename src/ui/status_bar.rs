@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ptr::NonNull;
 
 use block2::RcBlock;
@@ -13,16 +14,18 @@ use objc2_foundation::{
     NSArray, NSAttributedString, NSDictionary, NSMutableAttributedString, NSString,
 };
 
+use crate::config::{ColorTheme, HexColorOverride};
 use crate::model::{MISSING_VALUE, MenuBarSegment, Provider};
-use crate::ui::view_model::{UiSnapshot, provider_colors};
+use crate::ui::view_model::{
+    CRITICAL_COLORS, ProviderColorPair, UiSnapshot, resolve_provider_colors,
+};
 
 const MENU_BAR_FONT_SIZE: f64 = 11.5;
 const SEGMENT_SEPARATOR: &str = "  ";
 const STALE_ALPHA: f64 = 0.65;
 
-/// Dynamic `NSColor` adapting automatically between Dark Mode and Light Mode.
-pub fn provider_dynamic_color(provider: Provider, stale: bool) -> Retained<NSColor> {
-    let pair = provider_colors(provider);
+/// Dynamic `NSColor` adapting automatically between Dark Mode and Light Mode for any color pair.
+pub fn dynamic_color_for_pair(pair: ProviderColorPair, stale: bool) -> Retained<NSColor> {
     let alpha = if stale { STALE_ALPHA } else { 1.0 };
     let (dr, dg, db) = pair.dark.components_f64();
     let (lr, lg, lb) = pair.light.components_f64();
@@ -51,11 +54,24 @@ pub fn provider_dynamic_color(provider: Provider, stale: bool) -> Retained<NSCol
     unsafe { NSColor::colorWithName_dynamicProvider(None, &block) }
 }
 
+/// Dynamic `NSColor` for a provider respecting `ColorTheme` and optional hex overrides.
+pub fn provider_dynamic_color(
+    provider: Provider,
+    theme: ColorTheme,
+    overrides: &BTreeMap<String, HexColorOverride>,
+    stale: bool,
+) -> Retained<NSColor> {
+    let pair = resolve_provider_colors(provider, theme, overrides);
+    dynamic_color_for_pair(pair, stale)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RenderKey {
     segments: Vec<MenuBarSegment>,
     fallback_only: bool,
     tooltip: String,
+    color_theme: ColorTheme,
+    provider_colors: BTreeMap<String, HexColorOverride>,
 }
 
 /// Snapshot of real AppKit button state used by `--ui-smoke-test`.
@@ -98,6 +114,8 @@ impl StatusBarView {
             segments: snapshot.menu_bar_segments.clone(),
             fallback_only: snapshot.menu_bar_fallback_only,
             tooltip: snapshot.menu_bar_tooltip.clone(),
+            color_theme: snapshot.color_theme,
+            provider_colors: snapshot.provider_colors.clone(),
         };
         if self.last_render.as_ref() == Some(&next_key) {
             return false;
@@ -146,9 +164,36 @@ impl StatusBarView {
                 let gap = make_colored_run(SEGMENT_SEPARATOR, &self.font, &NSColor::clearColor());
                 combined.appendAttributedString(&gap);
             }
-            let color = provider_dynamic_color(seg.provider, seg.stale);
-            let run = make_colored_run(&seg.text, &self.font, &color);
-            combined.appendAttributedString(&run);
+
+            let base_color = provider_dynamic_color(
+                seg.provider,
+                snapshot.color_theme,
+                &snapshot.provider_colors,
+                seg.stale,
+            );
+            let crit_color = (seg.five_hour_critical || seg.weekly_critical)
+                .then(|| dynamic_color_for_pair(CRITICAL_COLORS, seg.stale));
+
+            let five_color = if seg.five_hour_critical {
+                crit_color.as_deref().unwrap_or(&base_color)
+            } else {
+                &base_color
+            };
+            let five_run = make_colored_run(&seg.five_hour_text, &self.font, five_color);
+            combined.appendAttributedString(&five_run);
+
+            if let Some(ref weekly_text) = seg.weekly_text {
+                let slash_run = make_colored_run("/", &self.font, &base_color);
+                combined.appendAttributedString(&slash_run);
+
+                let weekly_color = if seg.weekly_critical {
+                    crit_color.as_deref().unwrap_or(&base_color)
+                } else {
+                    &base_color
+                };
+                let weekly_run = make_colored_run(weekly_text, &self.font, weekly_color);
+                combined.appendAttributedString(&weekly_run);
+            }
         }
 
         combined
